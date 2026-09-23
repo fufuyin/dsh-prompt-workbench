@@ -23,13 +23,37 @@
  * GET and the check would reject the plugin's own traffic.
  */
 
+import { existsSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import { queryParam, readJsonBody, sameOrigin, sendJson } from './http.ts'
 import { RunRegistry, type HostServices } from './runs.ts'
+import { errorMessage } from './prompt.ts'
 
 /** The module name the profile patch inserts. */
 export const name = 'dsh-prompt-workbench'
+
+/** The same name, narrowed to a string for the diagnostics payloads. */
+const PACKAGE_NAME: string = name
+
+/** One self-diagnosis line. */
+interface DiagCheck {
+  readonly id: string
+  readonly ok: boolean
+  readonly detail: string
+}
+
+/**
+ * The slice of the host `clientModules` service the diagnostics route reads.
+ *
+ * Read structurally on purpose: this plugin must keep loading even when the web
+ * shell (and therefore this service) is absent, which is exactly the case the
+ * diagnostics exist to report.
+ */
+interface ClientModulesLike {
+  graph?(): { readonly rev?: unknown; readonly entries?: unknown }
+  clientPath?(id: string): unknown
+}
 
 /**
  * `webServer` is a hard dependency: without it there is no carrier at all.
@@ -138,8 +162,94 @@ export function apply(ctx: Context): void {
     sendJson(response, 200, { ok: found, status: found ? 'cancelled' : 'missing' })
   })
 
+  /**
+   * `GET /diag` — self-diagnosis for the browser half.
+   *
+   * The browser half can only fail where nobody can see it: a plugin whose
+   * client module never reaches the boot graph renders nothing and reports
+   * nothing, and the `/plugins/...` route answers unauthenticated probes with
+   * 404 for *every* plugin, so it cannot be used to tell the cases apart.
+   *
+   * This route asks the host's own client-module registry the questions that
+   * do distinguish them, so a user can open one URL instead of devtools.
+   * Every probe is individually guarded: a diagnostic that throws is worse
+   * than no diagnostic.
+   */
+  const diag = route('exact', `${API}/diag`, (_request, response) => {
+    const checks: DiagCheck[] = []
+    let moduleIds: string[] = []
+    let graphRev: string | null = null
+    let clientPath: string | null = null
+    let clientBundleExists = false
+
+    const clientModules = host.get('clientModules') as ClientModulesLike | undefined
+    if (clientModules === undefined || clientModules === null) {
+      checks.push({ id: 'client-modules', ok: false, detail: 'clientModules 服务不可用（该 profile 没有 web 外壳）' })
+    } else {
+      if (typeof clientModules.graph === 'function') {
+        try {
+          const graph = clientModules.graph()
+          graphRev = typeof graph.rev === 'string' ? graph.rev : null
+          const entries = Array.isArray(graph.entries) ? graph.entries : []
+          moduleIds = entries.flatMap((entry) => {
+            if (entry === null || typeof entry !== 'object') return []
+            const id = (entry as { id?: unknown }).id
+            return typeof id === 'string' ? [id] : []
+          })
+          checks.push({ id: 'client-graph', ok: true, detail: `启动图 rev=${graphRev ?? '?'}，模块 ${String(moduleIds.length)} 个` })
+          const inGraph = moduleIds.includes(PACKAGE_NAME)
+          checks.push({
+            id: 'module-in-graph',
+            ok: inGraph,
+            detail: inGraph
+              ? '客户端模块已在启动图中，外壳会预加载它'
+              : '客户端模块不在启动图中 —— 浏览器半永远不会执行（这正是界面不出现的直接原因）',
+          })
+        } catch (error) {
+          checks.push({ id: 'client-graph', ok: false, detail: `读取启动图失败：${errorMessage(error)}` })
+        }
+      }
+      if (typeof clientModules.clientPath === 'function') {
+        try {
+          const resolved = clientModules.clientPath(PACKAGE_NAME)
+          clientPath = typeof resolved === 'string' ? resolved : null
+          checks.push({
+            id: 'client-path',
+            ok: clientPath !== null,
+            detail: clientPath ?? 'clientModules 未登记本插件的 client 入口（dsh.client 未被识别）',
+          })
+        } catch (error) {
+          checks.push({ id: 'client-path', ok: false, detail: `读取 clientPath 失败：${errorMessage(error)}` })
+        }
+      }
+      if (clientPath !== null) {
+        try {
+          clientBundleExists = existsSync(clientPath)
+          checks.push({
+            id: 'client-file',
+            ok: clientBundleExists,
+            detail: clientBundleExists ? 'client 入口文件存在' : `client 入口文件不存在：${clientPath}`,
+          })
+        } catch {
+          // A filesystem probe that fails tells us nothing; omit the check rather than report a guess.
+        }
+      }
+    }
+
+    sendJson(response, 200, {
+      ok: true,
+      package: PACKAGE_NAME,
+      node: process.versions.node,
+      graphRev,
+      moduleIds,
+      clientPath,
+      clientBundleExists,
+      checks,
+    })
+  })
+
   host.effect(() => {
-    const disposers = [meta, start, poll, cancel]
+    const disposers = [meta, start, poll, cancel, diag]
     return () => {
       for (const dispose of disposers.reverse()) dispose()
       registry.dispose()

@@ -22,6 +22,7 @@ cd dsh-prompt-workbench
 npm install
 npm run build      # tsc for the host half, tsdown for the client bundle
 npm run typecheck
+npm test           # vitest over every pure module
 ```
 
 To try your build in a live harness, install the local checkout into a DSH
@@ -37,18 +38,21 @@ Then restart the profile and reload the web GUI.
 
 | Path | What lives there |
 | --- | --- |
-| `src/index.ts` | Host entry: declares `inject` and registers the plugin's HTTP routes. |
-| `src/runs.ts` | Host: the bounded run table and the one `llm.stream` call per run. |
+| `src/analyze.ts` | **Shared (pure)**: parsing, dimension detection, advice, outline templates. Imported by both halves. |
+| `src/index.ts` | Host entry: declares `inject` and registers the plugin's HTTP routes (including `/diag`). |
+| `src/runs.ts` | Host: the bounded run table, the one `llm.stream` call per run, and the wall-clock guard. |
 | `src/prompt.ts` | Host: rewrite modes and the system instruction builder. Pure functions, no I/O. |
 | `src/http.ts` | Host: JSON / same-origin / body-size helpers for the routes. |
 | `src/client/index.ts` | Client entry: inject declaration, style injection, mounting. |
-| `src/client/panel.ts` | Client: the two composer surfaces and the shared poller. |
+| `src/client/panel.ts` | Client: the two composer surfaces, the analysis strip, the advice list, and the shared poller. |
 | `src/client/api.ts` | Client: the `fetch` carrier against the host routes. |
+| `src/client/prefs.ts` | Client: versioned `localStorage` preferences with defensive reads. |
 | `src/client/store.ts` | Client: the tiny observable store both surfaces share. |
 | `src/client/diff.ts` | Client: token-level diff used by the comparison view. |
 | `src/client/styles.ts` | Client: the whole stylesheet, injected as one tagged `<style>`. |
 | `cordis.patch.yml` | The profile patch layer that installs this plugin. |
 | `scripts/preflight.mjs` | Post-build assertions, wired to `prepack`. |
+| `tests/` | Vitest suites for every pure module. |
 
 ## Ground rules
 

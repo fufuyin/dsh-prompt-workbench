@@ -61,6 +61,43 @@ export async function fetchMeta(): Promise<WorkbenchMeta | null> {
   }
 }
 
+/** One self-diagnosis line from `/diag`. */
+export interface DiagCheck {
+  readonly id: string
+  readonly ok: boolean
+  readonly detail: string
+}
+
+/** What `/diag` answers. */
+export interface DiagReport {
+  readonly ok: boolean
+  readonly package: string
+  readonly node: string
+  readonly graphRev: string | null
+  readonly moduleIds: readonly string[]
+  readonly clientPath: string | null
+  readonly clientBundleExists: boolean
+  readonly checks: readonly DiagCheck[]
+}
+
+/**
+ * Ask the host how it sees this plugin's browser half.
+ *
+ * This exists because the browser half can fail invisibly: if its module never
+ * reaches the boot graph, nothing renders and nothing reports. `/diag` is
+ * reachable from the working host half, so it is the one surface that can still
+ * answer when the UI cannot.
+ */
+export async function fetchDiag(): Promise<DiagReport | null> {
+  try {
+    const response = await fetch(api(`${API}/diag`))
+    if (!response.ok) return null
+    return (await response.json()) as DiagReport
+  } catch {
+    return null
+  }
+}
+
 /** Begin one rewrite. */
 export async function startRun(body: {
   readonly text: string

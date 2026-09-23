@@ -1,16 +1,19 @@
 /**
  * The shared observable store behind every surface of the plugin.
  *
- * The trigger pill, the floating composer panel, and the Run-card panel are
- * three separate React trees that must never disagree, so they all read this
- * one store. `set` compares before assigning, which keeps the 200 ms poll from
- * re-rendering when nothing actually changed.
+ * The trigger pill and the floating composer panel are two separate React trees
+ * that must never disagree, so they both read this one store. `set` compares
+ * before assigning, which keeps the 200 ms poll from re-rendering when nothing
+ * actually changed.
  */
+
+import type { DiagReport } from './api.ts'
+import { DEFAULT_PREFERENCES, type Preferences, type ResultView } from './prefs.ts'
 
 /** One rewrite run's lifecycle. */
 export type RunStatus = 'idle' | 'running' | 'done' | 'error'
 
-/** Everything the three surfaces render from. */
+/** Everything the surfaces render from. */
 export interface WorkbenchState {
   /** Whether the floating composer panel is expanded. */
   readonly open: boolean
@@ -18,6 +21,8 @@ export interface WorkbenchState {
   readonly mode: string
   /** Requested output language. */
   readonly lang: string
+  /** Which right-pane view is showing. */
+  readonly view: ResultView
   /** Run lifecycle. */
   readonly status: RunStatus
   /** Host-side task id while a run is live. */
@@ -38,6 +43,16 @@ export interface WorkbenchState {
   readonly model: string
   /** Milliseconds since the current run started. */
   readonly elapsedMs: number
+  /** Persisted presentation preferences. */
+  readonly prefs: Preferences
+  /** Whether the settings block is expanded. */
+  readonly configOpen: boolean
+  /** Whether the diagnostics block is expanded. */
+  readonly diagOpen: boolean
+  /** A diagnostics read is in flight. */
+  readonly diagLoading: boolean
+  /** The last diagnostics answer, or null before the first read. */
+  readonly diag: DiagReport | null
 }
 
 /** A store over one state shape. */
@@ -85,8 +100,9 @@ export function createStore<T extends object>(initial: T): Store<T> {
 export function initialState(): WorkbenchState {
   return {
     open: false,
-    mode: 'refine',
-    lang: 'auto',
+    mode: DEFAULT_PREFERENCES.defaultMode,
+    lang: DEFAULT_PREFERENCES.defaultLang,
+    view: DEFAULT_PREFERENCES.defaultView,
     status: 'idle',
     taskId: null,
     source: '',
@@ -97,5 +113,10 @@ export function initialState(): WorkbenchState {
     provider: '',
     model: '',
     elapsedMs: 0,
+    prefs: DEFAULT_PREFERENCES,
+    configOpen: false,
+    diagOpen: false,
+    diagLoading: false,
+    diag: null,
   }
 }

@@ -5,6 +5,359 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		let react = require("react");
+		//#region src/analyze.ts
+		/** Evidence patterns per dimension. Bilingual on purpose. */
+		const DIMENSION_PATTERNS = {
+			goal: [/目标|目的|想要|希望|需要|帮我|帮忙|实现|做一?[个款份]|写一?[个份]|搭建|开发|编写|生成|创建一个?|设计一个?|加一个?/, /\b(goal|objective|i want|i need|implement|build|create|develop|write|add)\b/i],
+			context: [/背景|现状|前提|目前|已有|现有|当前|基于|技术栈|环境/, /\b(context|background|currently|existing|already|based on|stack|environment)\b/i],
+			constraints: [/约束|限制|不要|不得|禁止|必须|务必|只能|不允许|兼容|性能|不能/, /\b(constraint|limit|must|must not|should not|only|forbid|compatib|performance|cannot)\b/i],
+			output: [/输出|返回|格式|以.{0,6}形式|表格|列表|代码块|文件结构/, /\b(output|format|return|as (?:a|an|json|markdown)|table|bullet)\b/i],
+			acceptance: [/验收|完成标准|完成定义|判定标准|测试通过|满足以下|自检/, /\b(acceptance|definition of done|criteria|test|verify|pass(?:es)?)\b/i],
+			examples: [/例如|举例|示例|比如|参考(?:样例|示例)/, /\b(for example|for instance|e\.g\.|such as|sample|example)\b/i]
+		};
+		/** Dimension labels, in report order. */
+		const DIMENSION_LABELS = {
+			goal: "目标",
+			context: "背景",
+			constraints: "约束",
+			output: "输出格式",
+			acceptance: "验收标准",
+			examples: "示例"
+		};
+		/** Report order: the order an agent reads a brief in. */
+		const DIMENSION_ORDER = [
+			"goal",
+			"context",
+			"constraints",
+			"output",
+			"acceptance",
+			"examples"
+		];
+		/**
+		* Phrases that push work back onto the reader. Kept separate per script so the
+		* explanation in the UI can say which one fired.
+		*/
+		const VAGUE_ZH = [
+			"一些",
+			"若干",
+			"尽量",
+			"最好",
+			"适当",
+			"等等",
+			"之类",
+			"相关的",
+			"合理的",
+			"优化一下",
+			"差不多",
+			"看情况",
+			"随便",
+			"更好",
+			"稍微",
+			"大概",
+			"可能"
+		];
+		const VAGUE_EN = [
+			"some",
+			"a few",
+			"several",
+			"as appropriate",
+			"if possible",
+			"reasonable",
+			"optimize",
+			"nicely",
+			"better",
+			"etc",
+			"and so on",
+			"maybe",
+			"roughly",
+			"somehow"
+		];
+		/** Placeholder markers that mean the brief is unfinished. */
+		const PLACEHOLDER_PATTERNS = [
+			/\bTODO\b/gi,
+			/\bTBD\b/gi,
+			/\bFIXME\b/gi,
+			/\bXXX\b/g,
+			/\?\?\?/g,
+			/待定/g,
+			/待补/g,
+			/占位/g
+		];
+		/** Vague-phrase suggestion snippets, keyed by the phrase that triggered them. */
+		function vagueDetail(phrase) {
+			return `“${phrase}”把决定权留给了执行者。换成可判定的具体值或范围。`;
+		}
+		/** Count fenced code blocks (``` pairs), tolerant of an unterminated trailing fence. */
+		function countCodeBlocks(text) {
+			const fences = text.match(/^[ \t]*```/gm);
+			return fences === null ? 0 : Math.floor(fences.length / 2) + fences.length % 2;
+		}
+		/** Count `@reference` tokens (file/session references the author pinned). */
+		function countReferences(text) {
+			const matches = text.match(/(^|\s)@[\w./\\-]+/g);
+			return matches === null ? 0 : matches.length;
+		}
+		/** Detect the draft's dominant script. */
+		function detectLanguage(text) {
+			const cjk = (text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) ?? []).length;
+			const latin = (text.match(/[A-Za-z]/g) ?? []).length;
+			if (cjk === 0 && latin === 0) return "en";
+			if (cjk === 0) return "en";
+			if (latin < cjk * .2) return "zh";
+			if (cjk < latin * .2) return "en";
+			return "mixed";
+		}
+		/** Find the first matching fragment for a dimension, for display as evidence. */
+		function findEvidence(text, patterns) {
+			for (const line of text.split(/\r?\n/)) for (const pattern of patterns) if (pattern.test(line)) {
+				const trimmed = line.trim();
+				return trimmed.length > 60 ? `${trimmed.slice(0, 60)}…` : trimmed;
+			}
+		}
+		/** Collect the vague phrases present, in first-appearance order. */
+		function collectVagueness(text) {
+			const found = [];
+			const lower = text.toLowerCase();
+			for (const phrase of VAGUE_ZH) {
+				const at = text.indexOf(phrase);
+				if (at !== -1) found.push({
+					phrase,
+					at
+				});
+			}
+			for (const phrase of VAGUE_EN) {
+				const match = new RegExp(`\\b${phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).exec(lower);
+				if (match !== null) found.push({
+					phrase,
+					at: match.index
+				});
+			}
+			return found.sort((a, b) => a.at - b.at).map((entry) => entry.phrase);
+		}
+		/** Collect unresolved placeholders, deduplicated, uppercased for latin markers. */
+		function collectPlaceholders(text) {
+			const seen = /* @__PURE__ */ new Set();
+			for (const pattern of PLACEHOLDER_PATTERNS) {
+				const matches = text.match(pattern);
+				if (matches === null) continue;
+				for (const match of matches) {
+					const normalized = /^[a-z]/i.test(match) ? match.toUpperCase() : match;
+					seen.add(normalized);
+				}
+			}
+			return [...seen];
+		}
+		/**
+		* The recommended section skeleton for a mode. `concise` has no skeleton on
+		* purpose — compression must not add structure the author did not ask for.
+		*/
+		function outlineFor(mode) {
+			if (mode === "concise") return [];
+			if (mode === "constraints") return [
+				{
+					id: "scope",
+					heading: "范围",
+					hint: "这次要做什么，做到哪为止"
+				},
+				{
+					id: "non-goals",
+					heading: "非目标",
+					hint: "明确不做什么，防止范围蔓延"
+				},
+				{
+					id: "constraints",
+					heading: "技术约束",
+					hint: "平台、版本、依赖、风格、兼容性"
+				},
+				{
+					id: "acceptance",
+					heading: "验收标准",
+					hint: "怎样算做完，如何验证"
+				}
+			];
+			if (mode === "refine") return [
+				{
+					id: "goal",
+					heading: "目标",
+					hint: "一句话说清最终要达成什么"
+				},
+				{
+					id: "requirements",
+					heading: "具体要求",
+					hint: "拆成可逐条核对的要求"
+				},
+				{
+					id: "deliverable",
+					heading: "交付物",
+					hint: "要产出什么，放在哪里"
+				}
+			];
+			return [
+				{
+					id: "goal",
+					heading: "目标",
+					hint: "一句话说清最终要达成什么"
+				},
+				{
+					id: "context",
+					heading: "背景",
+					hint: "现状、已有条件、约束前提"
+				},
+				{
+					id: "requirements",
+					heading: "具体要求",
+					hint: "拆成可逐条核对的要求"
+				},
+				{
+					id: "output",
+					heading: "输出格式",
+					hint: "交付形态：文件、代码块、表格…"
+				},
+				{
+					id: "acceptance",
+					heading: "验收标准",
+					hint: "怎样算做完，如何验证"
+				}
+			];
+		}
+		/**
+		* Turn the analysis into ordered, actionable advice.
+		*
+		* Severity policy: a missing goal blocks everything (high); missing
+		* constraints/acceptance cause rework (high/medium); vagueness and placeholders
+		* cause guessing (medium); missing examples is a nice-to-have (low).
+		*/
+		function buildSuggestions(input) {
+			const suggestions = [];
+			const missing = new Set(input.dimensions.filter((dimension) => !dimension.present).map((dimension) => dimension.id));
+			const structural = input.mode !== "concise";
+			if (missing.has("goal")) suggestions.push({
+				id: "add-goal",
+				severity: "high",
+				title: "补一句明确的目标",
+				detail: "没有目标时，执行者只能猜你想要什么，第一步就会偏。用一句话写清最终要达成什么。",
+				snippet: "## 目标\n<!-- 一句话说清最终要达成什么 -->\n"
+			});
+			if (missing.has("acceptance")) suggestions.push({
+				id: "add-acceptance",
+				severity: "high",
+				title: "补上验收标准",
+				detail: "没有验收标准就无法判断\"做完了\"，返工往往发生在这里。列出可逐条核对的判定条件。",
+				snippet: "## 验收标准\n- [ ] <!-- 条件一 -->\n- [ ] <!-- 条件二 -->\n"
+			});
+			if (structural && missing.has("constraints")) suggestions.push({
+				id: "add-constraints",
+				severity: "medium",
+				title: "补上约束与非目标",
+				detail: "约束决定方案边界。至少写明平台/版本/依赖限制，以及明确不做什么。",
+				snippet: "## 约束\n- 技术栈：\n- 版本/平台：\n\n## 非目标\n- <!-- 明确不做的事 -->\n"
+			});
+			if (structural && missing.has("output")) suggestions.push({
+				id: "add-output",
+				severity: "medium",
+				title: "指定输出格式",
+				detail: "写清交付形态（文件路径、代码块、表格…），能显著减少来回确认。",
+				snippet: "## 输出格式\n<!-- 例：单个 HTML 文件；或 Markdown 表格；或完整文件树 -->\n"
+			});
+			if (structural && missing.has("context")) suggestions.push({
+				id: "add-context",
+				severity: "low",
+				title: "补一点背景",
+				detail: "现状、已有代码、运行环境等前提，能让执行者少问一轮。",
+				snippet: "## 背景\n<!-- 现状、已有条件、相关文件 @路径 -->\n"
+			});
+			if (structural && missing.has("examples")) suggestions.push({
+				id: "add-examples",
+				severity: "low",
+				title: "可选：给一个示例",
+				detail: "一个输入/输出示例能消除歧义，尤其是格式类要求。"
+			});
+			for (const phrase of input.vagueness.slice(0, 5)) suggestions.push({
+				id: `vague-${phrase}`,
+				severity: "medium",
+				title: `替换模糊词「${phrase}」`,
+				detail: vagueDetail(phrase)
+			});
+			if (input.placeholders.length > 0) suggestions.push({
+				id: "resolve-placeholders",
+				severity: "medium",
+				title: `解决未填占位符（${input.placeholders.join("、")}）`,
+				detail: "占位符会被原样带进执行，等于把决定权交出去。要么填上，要么删掉。"
+			});
+			if (input.chars > 0 && input.chars < 30) suggestions.push({
+				id: "too-short",
+				severity: "high",
+				title: "草稿过短",
+				detail: "不到 30 字符通常不足以表达一个可执行任务。用下面的结构骨架把关键信息补齐。",
+				...input.outline.length === 0 ? {} : { snippet: input.outline.map((section) => `## ${section.heading}\n<!-- ${section.hint} -->\n`).join("\n") }
+			});
+			const order = {
+				high: 0,
+				medium: 1,
+				low: 2
+			};
+			return suggestions.sort((a, b) => order[a.severity] - order[b.severity]);
+		}
+		/**
+		* Analyze one draft.
+		*
+		* Deterministic and side-effect free: the same draft always yields the same
+		* report, which is what lets the UI render it on every keystroke and the tests
+		* assert on it.
+		*
+		* @param text - the raw draft.
+		* @param mode - the active rewrite mode; selects the outline template.
+		* @returns the full analysis.
+		*/
+		function analyzePrompt(text, mode) {
+			const dimensions = DIMENSION_ORDER.map((id) => {
+				const evidence = findEvidence(text, DIMENSION_PATTERNS[id]);
+				return evidence === void 0 ? {
+					id,
+					label: DIMENSION_LABELS[id],
+					present: false
+				} : {
+					id,
+					label: DIMENSION_LABELS[id],
+					present: true,
+					evidence
+				};
+			});
+			const present = dimensions.filter((dimension) => dimension.present).length;
+			const coverage = dimensions.length === 0 ? 0 : present / dimensions.length;
+			const vagueness = collectVagueness(text);
+			const placeholders = collectPlaceholders(text);
+			const outline = outlineFor(mode);
+			const chars = text.length;
+			let score = Math.round(coverage * 100);
+			score -= Math.min(vagueness.length, 5) * 6;
+			score -= Math.min(placeholders.length, 3) * 8;
+			if (chars > 0 && chars < 30) score -= 20;
+			if (chars === 0) score = 0;
+			score = Math.max(0, Math.min(100, score));
+			return {
+				chars,
+				lines: text === "" ? 0 : text.split(/\r?\n/).length,
+				language: detectLanguage(text),
+				dimensions,
+				coverage,
+				vagueness,
+				placeholders,
+				codeBlocks: countCodeBlocks(text),
+				references: countReferences(text),
+				score,
+				suggestions: buildSuggestions({
+					dimensions,
+					vagueness,
+					placeholders,
+					chars,
+					mode,
+					outline
+				}),
+				outline
+			};
+		}
+		//#endregion
 		//#region src/client/api.ts
 		/**
 		* The browser half's carrier: plain `fetch` against the plugin's own routes.
@@ -25,6 +378,23 @@ window.__ModuleLoader__.load({
 		async function fetchMeta() {
 			try {
 				const response = await fetch(api(`${API}/meta`));
+				if (!response.ok) return null;
+				return await response.json();
+			} catch {
+				return null;
+			}
+		}
+		/**
+		* Ask the host how it sees this plugin's browser half.
+		*
+		* This exists because the browser half can fail invisibly: if its module never
+		* reaches the boot graph, nothing renders and nothing reports. `/diag` is
+		* reachable from the working host half, so it is the one surface that can still
+		* answer when the UI cannot.
+		*/
+		async function fetchDiag() {
+			try {
+				const response = await fetch(api(`${API}/diag`));
 				if (!response.ok) return null;
 				return await response.json();
 			} catch {
@@ -150,6 +520,74 @@ window.__ModuleLoader__.load({
 			return trimmed.slice(firstBreak + 1, lastFence).replace(/\s+$/, "");
 		}
 		//#endregion
+		//#region src/client/prefs.ts
+		/** Storage key, versioned so a future shape change cannot be misread. */
+		const STORAGE_KEY = "dsh-prompt-workbench/prefs/v1";
+		/** Defaults, also the recovery target for any read failure. */
+		const DEFAULT_PREFERENCES = {
+			defaultMode: "refine",
+			defaultLang: "auto",
+			liveAnalysis: true,
+			defaultView: "result",
+			autoScroll: true,
+			showSuggestions: true
+		};
+		/** Coerce one unknown field onto the default's type, or fall back. */
+		function pickString(value, fallback, allowed) {
+			if (typeof value !== "string") return fallback;
+			if (allowed !== void 0 && !allowed.includes(value)) return fallback;
+			return value;
+		}
+		function pickBoolean(value, fallback) {
+			return typeof value === "boolean" ? value : fallback;
+		}
+		/**
+		* Read the stored preferences.
+		* @returns the merged preferences; never throws, never returns a partial object.
+		*/
+		function loadPreferences() {
+			try {
+				if (typeof localStorage === "undefined") return DEFAULT_PREFERENCES;
+				const raw = localStorage.getItem(STORAGE_KEY);
+				if (raw === null || raw === "") return DEFAULT_PREFERENCES;
+				const parsed = JSON.parse(raw);
+				if (parsed === null || typeof parsed !== "object") return DEFAULT_PREFERENCES;
+				const record = parsed;
+				return {
+					defaultMode: pickString(record.defaultMode, DEFAULT_PREFERENCES.defaultMode),
+					defaultLang: pickString(record.defaultLang, DEFAULT_PREFERENCES.defaultLang, [
+						"auto",
+						"zh",
+						"en"
+					]),
+					liveAnalysis: pickBoolean(record.liveAnalysis, DEFAULT_PREFERENCES.liveAnalysis),
+					defaultView: pickString(record.defaultView, DEFAULT_PREFERENCES.defaultView, [
+						"result",
+						"diff",
+						"outline"
+					]),
+					autoScroll: pickBoolean(record.autoScroll, DEFAULT_PREFERENCES.autoScroll),
+					showSuggestions: pickBoolean(record.showSuggestions, DEFAULT_PREFERENCES.showSuggestions)
+				};
+			} catch {
+				return DEFAULT_PREFERENCES;
+			}
+		}
+		/**
+		* Persist the preferences.
+		* @returns true when the write landed; false when storage refused it (which is
+		*   not an error the user needs to see — the session keeps working in memory).
+		*/
+		function savePreferences(preferences) {
+			try {
+				if (typeof localStorage === "undefined") return false;
+				localStorage.setItem(STORAGE_KEY, JSON.stringify(preferences));
+				return true;
+			} catch {
+				return false;
+			}
+		}
+		//#endregion
 		//#region src/client/store.ts
 		/** Create a store over `initial`. */
 		function createStore(initial) {
@@ -186,8 +624,9 @@ window.__ModuleLoader__.load({
 		function initialState() {
 			return {
 				open: false,
-				mode: "refine",
-				lang: "auto",
+				mode: DEFAULT_PREFERENCES.defaultMode,
+				lang: DEFAULT_PREFERENCES.defaultLang,
+				view: DEFAULT_PREFERENCES.defaultView,
 				status: "idle",
 				taskId: null,
 				source: "",
@@ -197,13 +636,18 @@ window.__ModuleLoader__.load({
 				note: "",
 				provider: "",
 				model: "",
-				elapsedMs: 0
+				elapsedMs: 0,
+				prefs: DEFAULT_PREFERENCES,
+				configOpen: false,
+				diagOpen: false,
+				diagLoading: false,
+				diag: null
 			};
 		}
 		//#endregion
 		//#region src/client/panel.ts
 		/**
-		* The two composer surfaces, ported from the working implementation.
+		* The composer surfaces.
 		*
 		*   conversation.input.left    -> the one-click trigger pill
 		*   conversation.input.overlay -> the floating workbench panel
@@ -212,15 +656,21 @@ window.__ModuleLoader__.load({
 		* `useInput` and `inputActions` as standard props — that is how the plugin
 		* reads the composer draft and writes a rewrite back into it.
 		*
-		* ## Why there is no Run-card panel any more
+		* One pipeline runs the whole surface:
 		*
-		* The original build also rendered a panel inside the `cordis_run` card via
-		* `tool.view.cordis`. That slot only exists for *dynamic* Cordis packages: its
-		* owner dispatches the key `${pluginId}.${packageId}` taken from a dynamic
+		*   draft → analyze (local, instant) → advice + outline → targeted rewrite → formatted result
+		*
+		* The analysis comes from the same pure module the host half uses, so advice
+		* appears as you type with no round trip and no token cost. Only the rewrite
+		* itself reaches the model.
+		*
+		* ## Why there is no Run-card panel
+		*
+		* `tool.view.cordis` only exists for *dynamic* Cordis packages: its owner
+		* dispatches the key `${pluginId}.${packageId}` taken from a dynamic
 		* `cordis_run` result, and the dynamic guard is the only thing that maps
 		* `key: 'self'` onto such a pair. An installed bundle has neither, so a
-		* registration there would never render. The surface was dropped rather than
-		* shipped dead.
+		* registration there would never render.
 		*/
 		/** Rewrite modes shown as tabs. `key` is the exact wire value the host accepts. */
 		const MODES = [
@@ -262,6 +712,146 @@ window.__ModuleLoader__.load({
 		];
 		/** Poll cadence while a run is live. */
 		const POLL_MS = 200;
+		/** Debounce for the live analysis while typing. */
+		const ANALYZE_MS = 180;
+		/** The right pane's view keys, in presentation order. */
+		const VIEWS = [
+			["result", "结果"],
+			["diff", "差异"],
+			["outline", "结构"]
+		];
+		/**
+		* Split a rewrite into presentable blocks.
+		*
+		* This is the "formatted output" half of the feature: the model returns plain
+		* text — which is what keeps it pasteable into the composer — and the panel
+		* renders that text's structure instead of dumping a wall of monospace.
+		*/
+		function splitBlocks(text) {
+			const blocks = [];
+			let code = null;
+			let list = null;
+			const flushList = () => {
+				if (list !== null) {
+					blocks.push({
+						kind: "list",
+						text: list.join("\n")
+					});
+					list = null;
+				}
+			};
+			for (const line of text.split("\n")) {
+				if (/^\s*```/.test(line)) {
+					flushList();
+					if (code === null) code = [];
+					else {
+						blocks.push({
+							kind: "code",
+							text: code.join("\n")
+						});
+						code = null;
+					}
+					continue;
+				}
+				if (code !== null) {
+					code.push(line);
+					continue;
+				}
+				if (/^#{1,6}\s+/.test(line)) {
+					flushList();
+					blocks.push({
+						kind: "heading",
+						text: line.replace(/^#{1,6}\s+/, "").trim()
+					});
+					continue;
+				}
+				if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+					if (list === null) list = [];
+					list.push(line.trim());
+					continue;
+				}
+				flushList();
+				if (line.trim() !== "") blocks.push({
+					kind: "text",
+					text: line
+				});
+			}
+			if (code !== null) blocks.push({
+				kind: "code",
+				text: code.join("\n")
+			});
+			flushList();
+			return blocks;
+		}
+		/** Render the analysis strip: score, dimension coverage, and signal counts. */
+		function analysisStrip(analysis, isZh) {
+			const label = (zh, en) => isZh ? zh : en;
+			const dims = analysis.dimensions.map((dimension) => (0, react.createElement)("span", {
+				key: dimension.id,
+				className: dimension.present ? "dsh-pw-dim dsh-pw-dim-on" : "dsh-pw-dim",
+				title: dimension.evidence ?? label("草稿中没有这一维度的迹象", "the draft shows no sign of this dimension")
+			}, dimension.present ? `✓ ${dimension.label}` : `○ ${dimension.label}`));
+			const signals = [];
+			if (analysis.vagueness.length > 0) signals.push(label(`模糊词 ${String(analysis.vagueness.length)}`, `${String(analysis.vagueness.length)} vague`));
+			if (analysis.placeholders.length > 0) signals.push(label(`占位符 ${String(analysis.placeholders.length)}`, `${String(analysis.placeholders.length)} placeholder`));
+			if (analysis.references > 0) signals.push(`@${String(analysis.references)}`);
+			if (analysis.codeBlocks > 0) signals.push(label(`代码块 ${String(analysis.codeBlocks)}`, `${String(analysis.codeBlocks)} code`));
+			return (0, react.createElement)("div", { className: "dsh-pw-strip" }, [
+				(0, react.createElement)("span", {
+					key: "score",
+					className: "dsh-pw-score"
+				}, label("可执行度", "Actionability"), (0, react.createElement)("b", null, ` ${String(analysis.score)}`)),
+				(0, react.createElement)("span", {
+					key: "meter",
+					className: "dsh-pw-meter"
+				}, (0, react.createElement)("span", {
+					className: "dsh-pw-meter-fill",
+					style: { width: `${String(analysis.score)}%` }
+				})),
+				(0, react.createElement)("span", {
+					key: "dims",
+					className: "dsh-pw-dims"
+				}, dims),
+				signals.length === 0 ? null : (0, react.createElement)("span", {
+					key: "sig",
+					className: "dsh-pw-signals"
+				}, signals.join(" · "))
+			]);
+		}
+		/** The advice list, with one-click insertion of each snippet. */
+		function suggestionList(suggestions, onInsert) {
+			if (suggestions.length === 0) return (0, react.createElement)("div", { className: "dsh-pw-sugg" }, (0, react.createElement)("div", { className: "dsh-pw-sugg-empty" }, "✓ 六个维度都有覆盖，没有发现需要补齐的项。"));
+			const rows = suggestions.map((suggestion) => (0, react.createElement)("div", {
+				key: suggestion.id,
+				className: "dsh-pw-sugg-row"
+			}, [
+				(0, react.createElement)("span", {
+					key: "sev",
+					className: `dsh-pw-sev dsh-pw-sev-${suggestion.severity}`,
+					title: suggestion.severity
+				}),
+				(0, react.createElement)("span", {
+					key: "body",
+					className: "dsh-pw-sugg-body"
+				}, [(0, react.createElement)("span", {
+					key: "t",
+					className: "dsh-pw-sugg-title"
+				}, suggestion.title), (0, react.createElement)("span", {
+					key: "d",
+					className: "dsh-pw-sugg-detail"
+				}, suggestion.detail)]),
+				suggestion.snippet === void 0 ? null : (0, react.createElement)("button", {
+					key: "ins",
+					type: "button",
+					className: "dsh-pw-sugg-insert",
+					title: "把这节骨架插入到草稿末尾",
+					onClick: () => {
+						onInsert(suggestion.snippet);
+					}
+				}, "插入")
+			]));
+			return (0, react.createElement)("div", { className: "dsh-pw-sugg" }, rows);
+		}
 		/**
 		* Mount both surfaces over one shared store and one shared poller.
 		* @returns a disposer that removes every registration and stops the poller.
@@ -341,7 +931,7 @@ window.__ModuleLoader__.load({
 			const timer = window.setInterval(() => {
 				tick();
 			}, POLL_MS);
-			/** Kick off one enhancement run over the current draft buffer. */
+			/** Kick off one rewrite over the current draft buffer. */
 			const run = async () => {
 				const snapshot = store.get();
 				if (starting || snapshot.status === "running") return;
@@ -388,6 +978,20 @@ window.__ModuleLoader__.load({
 				}
 				cancelRun(snapshot.taskId);
 			};
+			/** Run the host's self-diagnosis and show it inline. */
+			const diagnose = () => {
+				store.set({
+					diagLoading: true,
+					diagOpen: true
+				});
+				fetchDiag().then((report) => {
+					if (disposed) return;
+					store.set({
+						diagLoading: false,
+						diag: report
+					});
+				});
+			};
 			/** Subscribe one component to the shared store. Exactly two hooks, always. */
 			function useStore() {
 				const pair = (0, react.useState)(store.get);
@@ -397,6 +1001,24 @@ window.__ModuleLoader__.load({
 					setSnapshot(store.get());
 				}), []);
 				return snapshot;
+			}
+			/** Live, debounced analysis of the draft. */
+			function useAnalysis(text, mode, enabled) {
+				const [analysis, setAnalysis] = (0, react.useState)(null);
+				(0, react.useEffect)(() => {
+					if (!enabled) return;
+					const handle = window.setTimeout(() => {
+						setAnalysis(analyzePrompt(text, mode));
+					}, ANALYZE_MS);
+					return () => {
+						window.clearTimeout(handle);
+					};
+				}, [
+					text,
+					mode,
+					enabled
+				]);
+				return analysis;
 			}
 			/** The one-click composer pill. */
 			function Trigger(props) {
@@ -420,7 +1042,7 @@ window.__ModuleLoader__.load({
 				return (0, react.createElement)("button", {
 					type: "button",
 					className: state.open ? "dsh-pw-trigger dsh-pw-trigger-on" : "dsh-pw-trigger",
-					title: "提示词增强 · 一键优化与润色",
+					title: "提示词增强 · 分析、重构建议与一键重写",
 					"aria-label": "提示词增强",
 					"aria-expanded": state.open ? "true" : "false",
 					onMouseDown: (event) => {
@@ -446,11 +1068,43 @@ window.__ModuleLoader__.load({
 				const state = useStore();
 				const useInput = props.useInput;
 				const draft = typeof useInput === "function" ? useInput((input) => input.draft) : "";
-				const diffPair = (0, react.useState)(false);
-				const diffOn = diffPair[0];
-				const setDiffOn = diffPair[1];
-				if (!state.open) return null;
 				const inputActions = props.inputActions;
+				const resultRef = (0, react.useRef)(null);
+				const analysis = useAnalysis(state.source, state.mode, state.prefs.liveAnalysis);
+				const isZh = analysis !== null ? analysis.language !== "en" : detectLanguage(state.source) !== "en";
+				(0, react.useEffect)(() => {
+					if (!state.prefs.autoScroll || state.status !== "running") return;
+					const node = resultRef.current;
+					if (node !== null) node.scrollTop = node.scrollHeight;
+				}, [
+					state.output,
+					state.status,
+					state.prefs.autoScroll
+				]);
+				const insertSnippet = (0, react.useCallback)((snippet) => {
+					const current = store.get().source;
+					const separator = current.trim() === "" ? "" : "\n\n";
+					store.set({
+						source: `${current}${separator}${snippet}`,
+						note: "已插入结构骨架",
+						error: ""
+					});
+				}, []);
+				const setPrefs = (0, react.useCallback)((patch) => {
+					const next = {
+						...store.get().prefs,
+						...patch
+					};
+					if (!savePreferences(next)) {
+						store.set({
+							prefs: next,
+							note: "偏好已在本会话内生效，但浏览器拒绝持久化"
+						});
+						return;
+					}
+					store.set({ prefs: next });
+				}, []);
+				if (!state.open) return null;
 				const running = state.status === "running";
 				const done = state.status === "done";
 				const sourceChars = state.source.length;
@@ -469,6 +1123,23 @@ window.__ModuleLoader__.load({
 					key: "spacer",
 					className: "dsh-pw-spacer"
 				}));
+				headChildren.push((0, react.createElement)("button", {
+					key: "diag",
+					type: "button",
+					className: "dsh-pw-iconbtn",
+					title: "自检：查看插件在宿主侧的状态",
+					disabled: state.diagLoading,
+					onClick: diagnose
+				}, "◎"));
+				headChildren.push((0, react.createElement)("button", {
+					key: "cfg",
+					type: "button",
+					className: state.configOpen ? "dsh-pw-iconbtn dsh-pw-iconbtn-on" : "dsh-pw-iconbtn",
+					title: "设置",
+					onClick: () => {
+						store.set({ configOpen: !state.configOpen });
+					}
+				}, "⚙"));
 				headChildren.push((0, react.createElement)("button", {
 					key: "pull",
 					type: "button",
@@ -519,10 +1190,112 @@ window.__ModuleLoader__.load({
 					className: "dsh-pw-spacer"
 				}), langSegment]));
 				const hint = (0, react.createElement)("div", { className: "dsh-pw-hint" }, activeMode.hint);
+				const configPanel = state.configOpen ? (0, react.createElement)("div", { className: "dsh-pw-cfg" }, [
+					(0, react.createElement)("label", {
+						key: "live",
+						className: "dsh-pw-cfg-row"
+					}, [(0, react.createElement)("input", {
+						key: "i",
+						type: "checkbox",
+						checked: state.prefs.liveAnalysis,
+						onChange: (event) => {
+							setPrefs({ liveAnalysis: event.target.checked });
+						}
+					}), (0, react.createElement)("span", { key: "t" }, "实时分析（本地、免费、随输入更新）")]),
+					(0, react.createElement)("label", {
+						key: "sugg",
+						className: "dsh-pw-cfg-row"
+					}, [(0, react.createElement)("input", {
+						key: "i",
+						type: "checkbox",
+						checked: state.prefs.showSuggestions,
+						onChange: (event) => {
+							setPrefs({ showSuggestions: event.target.checked });
+						}
+					}), (0, react.createElement)("span", { key: "t" }, "显示重构建议")]),
+					(0, react.createElement)("label", {
+						key: "scroll",
+						className: "dsh-pw-cfg-row"
+					}, [(0, react.createElement)("input", {
+						key: "i",
+						type: "checkbox",
+						checked: state.prefs.autoScroll,
+						onChange: (event) => {
+							setPrefs({ autoScroll: event.target.checked });
+						}
+					}), (0, react.createElement)("span", { key: "t" }, "生成时自动滚动到最新内容")]),
+					(0, react.createElement)("label", {
+						key: "mode",
+						className: "dsh-pw-cfg-row"
+					}, [(0, react.createElement)("span", {
+						key: "t",
+						className: "dsh-pw-cfg-label"
+					}, "默认模式"), (0, react.createElement)("select", {
+						key: "s",
+						className: "dsh-pw-select",
+						value: state.prefs.defaultMode,
+						onChange: (event) => {
+							setPrefs({ defaultMode: event.target.value });
+						}
+					}, MODES.map((entry) => (0, react.createElement)("option", {
+						key: entry.key,
+						value: entry.key
+					}, entry.label)))]),
+					(0, react.createElement)("label", {
+						key: "view",
+						className: "dsh-pw-cfg-row"
+					}, [(0, react.createElement)("span", {
+						key: "t",
+						className: "dsh-pw-cfg-label"
+					}, "默认结果视图"), (0, react.createElement)("select", {
+						key: "s",
+						className: "dsh-pw-select",
+						value: state.prefs.defaultView,
+						onChange: (event) => {
+							setPrefs({ defaultView: event.target.value });
+						}
+					}, [
+						(0, react.createElement)("option", {
+							key: "result",
+							value: "result"
+						}, "增强结果"),
+						(0, react.createElement)("option", {
+							key: "diff",
+							value: "diff"
+						}, "差异对比"),
+						(0, react.createElement)("option", {
+							key: "outline",
+							value: "outline"
+						}, "结构覆盖")
+					])])
+				]) : null;
+				const diagPanel = state.diagOpen ? (0, react.createElement)("div", { className: "dsh-pw-diag" }, [(0, react.createElement)("div", {
+					key: "h",
+					className: "dsh-pw-diag-head"
+				}, [(0, react.createElement)("span", { key: "t" }, "宿主侧自检"), (0, react.createElement)("button", {
+					key: "x",
+					type: "button",
+					className: "dsh-pw-iconbtn",
+					onClick: () => {
+						store.set({ diagOpen: false });
+					}
+				}, "✕")]), state.diagLoading ? (0, react.createElement)("div", {
+					key: "l",
+					className: "dsh-pw-muted"
+				}, "检测中…") : state.diag === null ? (0, react.createElement)("div", {
+					key: "n",
+					className: "dsh-pw-msg-err"
+				}, "自检接口不可达（宿主半未响应）") : (0, react.createElement)("div", { key: "b" }, [...state.diag.checks.map((check) => (0, react.createElement)("div", {
+					key: check.id,
+					className: check.ok ? "dsh-pw-diag-row dsh-pw-ok" : "dsh-pw-diag-row dsh-pw-bad"
+				}, `${check.ok ? "✓" : "✗"} ${check.detail}`)), (0, react.createElement)("div", {
+					key: "meta",
+					className: "dsh-pw-diag-meta"
+				}, `node ${state.diag.node} · 启动图 ${state.diag.graphRev ?? "?"} · 模块 ${String(state.diag.moduleIds.length)} 个`)])]) : null;
 				const sourcePane = (0, react.createElement)("section", { className: "dsh-pw-pane" }, (0, react.createElement)("div", { className: "dsh-pw-pane-head" }, (0, react.createElement)("span", null, "原始提示词"), (0, react.createElement)("span", { className: "dsh-pw-count" }, `${String(sourceChars)} 字符`)), (0, react.createElement)("textarea", {
 					className: "dsh-pw-input",
 					value: state.source,
-					placeholder: "粘贴或输入提示词，中英文均可……\n\n也可以点右上角 ⭯ 直接读取输入框里的草稿。",
+					placeholder: "粘贴或输入提示词，中英文均可……\n\n也可以点右上角 ⭯ 直接读取输入框里的草稿。\n左侧输入会即时分析，下方给出重构建议。",
 					spellCheck: false,
 					onChange: (event) => {
 						store.set({
@@ -538,8 +1311,52 @@ window.__ModuleLoader__.load({
 						}
 					}
 				}));
+				const view = state.view;
+				const viewSegment = (0, react.createElement)("span", { className: "dsh-pw-seg" }, VIEWS.map(([key, label]) => (0, react.createElement)("button", {
+					key,
+					type: "button",
+					className: view === key ? "dsh-pw-seg-on" : void 0,
+					onClick: () => {
+						store.set({ view: key });
+					}
+				}, label)));
 				const bodyChildren = [];
-				if (state.output === "" && running) bodyChildren.push((0, react.createElement)("span", {
+				if (view === "diff") {
+					if (state.output === "" || !done) bodyChildren.push((0, react.createElement)("span", {
+						key: "d",
+						className: "dsh-pw-muted"
+					}, "完成一次增强后可查看逐词差异。"));
+					else {
+						const parts = computeDiff(state.source, state.output);
+						if (parts === null) {
+							bodyChildren.push((0, react.createElement)("span", { key: "plain" }, state.output));
+							bodyChildren.push((0, react.createElement)("div", {
+								key: "cap",
+								className: "dsh-pw-muted"
+							}, "（文本较长，已跳过逐词差异高亮）"));
+						} else for (const [index, part] of parts.entries()) {
+							const className = part.kind === "add" ? "dsh-pw-add" : part.kind === "del" ? "dsh-pw-del" : "dsh-pw-same";
+							bodyChildren.push((0, react.createElement)("span", {
+								key: String(index),
+								className
+							}, part.text));
+						}
+					}
+				} else if (view === "outline") {
+					const target = state.output === "" ? state.source : state.output;
+					const outlineAnalysis = analyzePrompt(target, state.mode);
+					if (outlineAnalysis.outline.length === 0) bodyChildren.push((0, react.createElement)("span", {
+						key: "none",
+						className: "dsh-pw-muted"
+					}, "当前模式不追加结构骨架（精简表达只做删减）。"));
+					else for (const section of outlineAnalysis.outline) {
+						const covered = target.includes(section.heading);
+						bodyChildren.push((0, react.createElement)("div", {
+							key: section.id,
+							className: covered ? "dsh-pw-outline-row dsh-pw-ok" : "dsh-pw-outline-row dsh-pw-bad"
+						}, `${covered ? "✓" : "○"} ${section.heading} — ${section.hint}`));
+					}
+				} else if (state.output === "" && running) bodyChildren.push((0, react.createElement)("span", {
 					key: "wait",
 					className: "dsh-pw-muted"
 				}, "正在思考…"));
@@ -547,27 +1364,23 @@ window.__ModuleLoader__.load({
 					key: "idle",
 					className: "dsh-pw-muted"
 				}, "增强结果会在这里流式出现。"));
-				else if (diffOn && done) {
-					const parts = computeDiff(state.source, state.output);
-					if (parts === null) {
-						bodyChildren.push((0, react.createElement)("span", { key: "plain" }, state.output));
+				else {
+					const blocks = splitBlocks(state.output);
+					for (const [index, block] of blocks.entries()) {
+						const className = block.kind === "heading" ? "dsh-pw-block dsh-pw-block-h" : block.kind === "code" ? "dsh-pw-block dsh-pw-block-code" : block.kind === "list" ? "dsh-pw-block dsh-pw-block-list" : "dsh-pw-block";
+						const tail = running && index === blocks.length - 1 ? " dsh-pw-caret" : "";
 						bodyChildren.push((0, react.createElement)("div", {
-							key: "cap",
-							className: "dsh-pw-muted"
-						}, "（文本较长，已跳过逐词差异高亮）"));
-					} else for (const [index, part] of parts.entries()) {
-						const className = part.kind === "add" ? "dsh-pw-add" : part.kind === "del" ? "dsh-pw-del" : "dsh-pw-same";
-						bodyChildren.push((0, react.createElement)("span", {
 							key: String(index),
-							className
-						}, part.text));
+							className: `${className}${tail}`
+						}, block.text));
 					}
-				} else bodyChildren.push((0, react.createElement)("span", {
-					key: "live",
-					className: running ? "dsh-pw-caret" : void 0
-				}, state.output));
-				const outputPane = (0, react.createElement)("section", { className: "dsh-pw-pane" }, (0, react.createElement)("div", { className: "dsh-pw-pane-head" }, (0, react.createElement)("span", null, done && diffOn ? "差异对比（新增高亮 / 删除划线）" : "增强结果"), (0, react.createElement)("span", { className: "dsh-pw-count" }, `${String(outputChars)} 字符`)), (0, react.createElement)("div", { className: "dsh-pw-body" }, bodyChildren));
+				}
+				const outputPane = (0, react.createElement)("section", { className: "dsh-pw-pane" }, (0, react.createElement)("div", { className: "dsh-pw-pane-head" }, (0, react.createElement)("span", null, view === "diff" ? "差异对比" : view === "outline" ? "结构覆盖" : "增强结果"), (0, react.createElement)("span", { className: "dsh-pw-spacer" }), viewSegment, (0, react.createElement)("span", { className: "dsh-pw-count" }, `${String(outputChars)} 字符`)), (0, react.createElement)("div", {
+					className: "dsh-pw-body",
+					ref: resultRef
+				}, bodyChildren));
 				const grid = (0, react.createElement)("div", { className: "dsh-pw-grid" }, [sourcePane, outputPane]);
+				const advice = state.prefs.showSuggestions && analysis !== null ? suggestionList(analysis.suggestions, insertSnippet) : null;
 				const canWrite = inputActions !== void 0 && typeof inputActions.setDraft === "function" && state.output !== "";
 				const footChildren = [];
 				if (running) footChildren.push((0, react.createElement)("button", {
@@ -627,15 +1440,6 @@ window.__ModuleLoader__.load({
 						});
 					}
 				}, "复制"));
-				if (done) footChildren.push((0, react.createElement)("button", {
-					key: "diff",
-					type: "button",
-					className: diffOn ? "dsh-pw-btn dsh-pw-btn-primary" : "dsh-pw-btn",
-					title: "高亮显示新增与删除的片段",
-					onClick: () => {
-						setDiffOn(!diffOn);
-					}
-				}, "差异高亮"));
 				const seconds = (state.elapsedMs / 1e3).toFixed(1);
 				const statusText = running ? `生成中 · ${seconds}s · ${String(outputChars)} 字符` : done ? `完成 · ${seconds}s · ${String(sourceChars)} → ${String(outputChars)} 字符` : state.model === "" ? "待增强" : `就绪 · ${state.model}`;
 				footChildren.push((0, react.createElement)("span", {
@@ -646,7 +1450,24 @@ window.__ModuleLoader__.load({
 				if (state.error !== "") messages.push((0, react.createElement)("div", {
 					key: "err",
 					className: "dsh-pw-msg dsh-pw-msg-err"
-				}, `⚠ ${state.error}`));
+				}, [
+					(0, react.createElement)("span", { key: "t" }, `⚠ ${state.error}`),
+					(0, react.createElement)("button", {
+						key: "retry",
+						type: "button",
+						className: "dsh-pw-btn dsh-pw-btn-tiny",
+						disabled: running,
+						onClick: () => {
+							run();
+						}
+					}, "重试"),
+					(0, react.createElement)("button", {
+						key: "diag",
+						type: "button",
+						className: "dsh-pw-btn dsh-pw-btn-tiny",
+						onClick: diagnose
+					}, "自检")
+				]));
 				if (state.note !== "") messages.push((0, react.createElement)("div", {
 					key: "note",
 					className: "dsh-pw-msg dsh-pw-msg-ok"
@@ -660,7 +1481,11 @@ window.__ModuleLoader__.load({
 						className: "dsh-pw-head"
 					}, headChildren),
 					(0, react.createElement)("div", { key: "barwrap" }, [bar, hint]),
-					grid,
+					configPanel === null ? null : (0, react.createElement)("div", { key: "cfg" }, configPanel),
+					diagPanel === null ? null : (0, react.createElement)("div", { key: "diag" }, diagPanel),
+					analysis === null ? null : (0, react.createElement)("div", { key: "strip" }, analysisStrip(analysis, isZh)),
+					(0, react.createElement)("div", { key: "gridwrap" }, grid),
+					advice === null ? null : (0, react.createElement)("div", { key: "advice" }, advice),
 					messages.length === 0 ? null : (0, react.createElement)("div", { key: "msgs" }, messages),
 					(0, react.createElement)("div", { key: "foot" }, footChildren)
 				]);
@@ -677,6 +1502,13 @@ window.__ModuleLoader__.load({
 				if (typeof props.useInput !== "function") return null;
 				return (0, react.createElement)(Panel, props);
 			}
+			const prefs = loadPreferences();
+			store.set({
+				mode: prefs.defaultMode,
+				lang: prefs.defaultLang,
+				view: prefs.defaultView,
+				prefs
+			});
 			const offLeft = slots.inject("conversation.input.left", () => slots.register({
 				name: "conversation.input.left",
 				id: "prompt-workbench-trigger",
@@ -848,6 +1680,112 @@ window.__ModuleLoader__.load({
 .dsh-pw-msg { padding: 0 14px 10px; font-size: 12px; }
 .dsh-pw-msg-err { color: var(--dsw-alias-state-error-primary); }
 .dsh-pw-msg-ok { color: var(--dsw-alias-state-success-primary); }
+
+.dsh-pw-iconbtn-on {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+.dsh-pw-btn-tiny { height: 24px; padding: 0 8px; font-size: 11px; }
+.dsh-pw-msg { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* Analysis strip: actionability score, dimension coverage, signal counts. */
+.dsh-pw-strip {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 14px 0; font-size: 11px; color: var(--dsw-alias-label-secondary);
+}
+.dsh-pw-score b { color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; }
+.dsh-pw-meter {
+  display: inline-block; width: 90px; height: 5px; border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-2); overflow: hidden; flex: 0 0 auto;
+}
+.dsh-pw-meter-fill {
+  display: block; height: 100%; border-radius: 999px;
+  background: var(--dsw-alias-brand-primary); transition: width .25s ease;
+}
+.dsh-pw-dims { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.dsh-pw-dim {
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l1); opacity: .55;
+}
+.dsh-pw-dim-on {
+  opacity: 1; color: var(--dsw-alias-state-success-primary);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent);
+}
+.dsh-pw-signals { font-variant-numeric: tabular-nums; }
+
+/* Restructuring advice. */
+.dsh-pw-sugg { padding: 10px 14px 0; display: flex; flex-direction: column; gap: 6px; }
+.dsh-pw-sugg-empty {
+  font-size: 12px; color: var(--dsw-alias-state-success-primary);
+  padding: 8px 10px; border-radius: 10px;
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 8%, transparent);
+}
+.dsh-pw-sugg-row {
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 10px; background: var(--dsw-alias-bg-layer-2, transparent);
+}
+.dsh-pw-sev { flex: 0 0 auto; width: 6px; height: 6px; margin-top: 5px; border-radius: 50%; }
+.dsh-pw-sev-high { background: var(--dsw-alias-state-error-primary); }
+.dsh-pw-sev-medium { background: var(--dsw-alias-state-warn-primary); }
+.dsh-pw-sev-low { background: var(--dsw-alias-label-secondary); }
+.dsh-pw-sugg-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.dsh-pw-sugg-title { font-size: 12px; color: var(--dsw-alias-label-primary); }
+.dsh-pw-sugg-detail { font-size: 11.5px; color: var(--dsw-alias-label-secondary); line-height: 1.5; }
+.dsh-pw-sugg-insert {
+  flex: 0 0 auto; height: 24px; padding: 0 10px; border-radius: 7px;
+  border: 1px solid var(--dsw-alias-border-l1); background: transparent;
+  color: var(--dsw-alias-label-secondary); font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.dsh-pw-sugg-insert:hover { color: var(--dsw-alias-brand-primary); border-color: var(--dsw-alias-brand-primary); }
+
+/* Formatted result blocks. */
+.dsh-pw-block { margin: 0 0 6px; }
+.dsh-pw-block:last-child { margin-bottom: 0; }
+.dsh-pw-block-h {
+  font-weight: 600; color: var(--dsw-alias-label-primary);
+  margin: 10px 0 4px; padding-bottom: 3px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.dsh-pw-block-h:first-child { margin-top: 0; }
+.dsh-pw-block-list { color: var(--dsw-alias-label-primary); }
+.dsh-pw-block-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+  background: var(--dsw-alias-bg-base); border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px; padding: 8px 10px; white-space: pre; overflow-x: auto;
+}
+
+/* Outline coverage. */
+.dsh-pw-outline-row { padding: 5px 0; font-size: 12px; border-bottom: 1px dashed var(--dsw-alias-border-l1); }
+.dsh-pw-outline-row:last-child { border-bottom: 0; }
+.dsh-pw-ok { color: var(--dsw-alias-state-success-primary); }
+.dsh-pw-bad { color: var(--dsw-alias-label-secondary); }
+
+/* Settings. */
+.dsh-pw-cfg {
+  margin: 10px 14px 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+.dsh-pw-cfg-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dsw-alias-label-primary); }
+.dsh-pw-cfg-label { min-width: 84px; color: var(--dsw-alias-label-secondary); }
+.dsh-pw-select {
+  height: 26px; padding: 0 6px; border-radius: 8px; font: inherit; font-size: 12px;
+  border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-overlay, transparent);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Host-side self-diagnosis. */
+.dsh-pw-diag {
+  margin: 10px 14px 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 5px;
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-2, transparent);
+}
+.dsh-pw-diag-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; }
+.dsh-pw-diag-head > span { flex: 1 1 auto; }
+.dsh-pw-diag-row { font-size: 11.5px; line-height: 1.5; }
+.dsh-pw-diag-meta { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 2px; }
 
 @keyframes dsh-pw-spin { to { transform: rotate(360deg); } }
 @keyframes dsh-pw-blink { 50% { opacity: 0; } }

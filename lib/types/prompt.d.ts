@@ -25,7 +25,13 @@ export declare function outputLanguage(language: OutputLanguage, source: string)
  *
  * Rules 1–4 protect the user: the model must not answer the prompt, must not
  * invent facts, and must leave placeholders and code blocks untouched.
+ *
+ * @param mode - the active rewrite mode.
+ * @param outLang - the resolved output language.
+ * @param gaps - an optional pre-computed gap report from `analyzePrompt`, so the
+ *   rewrite targets the dimensions this draft actually lacks instead of
+ *   applying the same generic treatment to every draft.
  */
-export declare function buildSystemInstruction(mode: RewriteMode, outLang: 'zh' | 'en'): string;
+export declare function buildSystemInstruction(mode: RewriteMode, outLang: 'zh' | 'en', gaps?: string): string;
 /** Normalize any thrown value into a printable message. */
 export declare function errorMessage(error: unknown): string;

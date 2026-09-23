@@ -1,5 +1,5 @@
 /**
- * The two composer surfaces, ported from the working implementation.
+ * The composer surfaces.
  *
  *   conversation.input.left    -> the one-click trigger pill
  *   conversation.input.overlay -> the floating workbench panel
@@ -8,20 +8,28 @@
  * `useInput` and `inputActions` as standard props — that is how the plugin
  * reads the composer draft and writes a rewrite back into it.
  *
- * ## Why there is no Run-card panel any more
+ * One pipeline runs the whole surface:
  *
- * The original build also rendered a panel inside the `cordis_run` card via
- * `tool.view.cordis`. That slot only exists for *dynamic* Cordis packages: its
- * owner dispatches the key `${pluginId}.${packageId}` taken from a dynamic
+ *   draft → analyze (local, instant) → advice + outline → targeted rewrite → formatted result
+ *
+ * The analysis comes from the same pure module the host half uses, so advice
+ * appears as you type with no round trip and no token cost. Only the rewrite
+ * itself reaches the model.
+ *
+ * ## Why there is no Run-card panel
+ *
+ * `tool.view.cordis` only exists for *dynamic* Cordis packages: its owner
+ * dispatches the key `${pluginId}.${packageId}` taken from a dynamic
  * `cordis_run` result, and the dynamic guard is the only thing that maps
  * `key: 'self'` onto such a pair. An installed bundle has neither, so a
- * registration there would never render. The surface was dropped rather than
- * shipped dead.
+ * registration there would never render.
  */
 
-import { createElement, useEffect, useState, type ReactNode } from 'react'
-import { cancelRun, fetchMeta, pollRun, startRun } from './api.ts'
+import { createElement, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { analyzePrompt, detectLanguage, type PromptAnalysis, type Suggestion } from '../analyze.ts'
+import { cancelRun, fetchDiag, fetchMeta, pollRun, startRun } from './api.ts'
 import { computeDiff, stripOuterFence } from './diff.ts'
+import { loadPreferences, savePreferences, type Preferences, type ResultView } from './prefs.ts'
 import { createStore, initialState, type WorkbenchState } from './store.ts'
 
 /** Rewrite modes shown as tabs. `key` is the exact wire value the host accepts. */
@@ -41,6 +49,16 @@ const LANGS = [
 
 /** Poll cadence while a run is live. */
 const POLL_MS = 200
+
+/** Debounce for the live analysis while typing. */
+const ANALYZE_MS = 180
+
+/** The right pane's view keys, in presentation order. */
+const VIEWS = [
+  ['result', '结果'],
+  ['diff', '差异'],
+  ['outline', '结构'],
+] as const
 
 /** The slice of `InputState` the plugin reads. */
 export interface InputStateLike {
@@ -65,7 +83,7 @@ export interface SlotsLike {
 }
 
 /** Human-readable failure text. */
-function messageOf(error: unknown): string {
+export function messageOf(error: unknown): string {
   if (error === null || error === undefined) return '未知错误'
   if (typeof error === 'string') return error
   if (typeof error === 'object' && 'message' in error) {
@@ -73,6 +91,128 @@ function messageOf(error: unknown): string {
     if (typeof message === 'string' && message !== '') return message
   }
   return String(error)
+}
+
+/** One formatted block of a rewrite. */
+export interface ResultBlock {
+  readonly kind: 'heading' | 'list' | 'code' | 'text'
+  readonly text: string
+}
+
+/**
+ * Split a rewrite into presentable blocks.
+ *
+ * This is the "formatted output" half of the feature: the model returns plain
+ * text — which is what keeps it pasteable into the composer — and the panel
+ * renders that text's structure instead of dumping a wall of monospace.
+ */
+export function splitBlocks(text: string): ResultBlock[] {
+  const blocks: ResultBlock[] = []
+  let code: string[] | null = null
+  let list: string[] | null = null
+  const flushList = (): void => {
+    if (list !== null) {
+      blocks.push({ kind: 'list', text: list.join('\n') })
+      list = null
+    }
+  }
+  for (const line of text.split('\n')) {
+    if (/^\s*```/.test(line)) {
+      flushList()
+      if (code === null) code = []
+      else {
+        blocks.push({ kind: 'code', text: code.join('\n') })
+        code = null
+      }
+      continue
+    }
+    if (code !== null) {
+      code.push(line)
+      continue
+    }
+    if (/^#{1,6}\s+/.test(line)) {
+      flushList()
+      blocks.push({ kind: 'heading', text: line.replace(/^#{1,6}\s+/, '').trim() })
+      continue
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+      if (list === null) list = []
+      list.push(line.trim())
+      continue
+    }
+    flushList()
+    if (line.trim() !== '') blocks.push({ kind: 'text', text: line })
+  }
+  if (code !== null) blocks.push({ kind: 'code', text: code.join('\n') })
+  flushList()
+  return blocks
+}
+
+/** Render the analysis strip: score, dimension coverage, and signal counts. */
+function analysisStrip(analysis: PromptAnalysis, isZh: boolean): ReactNode {
+  const label = (zh: string, en: string): string => (isZh ? zh : en)
+  const dims = analysis.dimensions.map((dimension) => createElement('span', {
+    key: dimension.id,
+    className: dimension.present ? 'dsh-pw-dim dsh-pw-dim-on' : 'dsh-pw-dim',
+    title: dimension.evidence ?? label('草稿中没有这一维度的迹象', 'the draft shows no sign of this dimension'),
+  }, dimension.present ? `✓ ${dimension.label}` : `○ ${dimension.label}`))
+  const signals: string[] = []
+  if (analysis.vagueness.length > 0) {
+    signals.push(label(`模糊词 ${String(analysis.vagueness.length)}`, `${String(analysis.vagueness.length)} vague`))
+  }
+  if (analysis.placeholders.length > 0) {
+    signals.push(label(`占位符 ${String(analysis.placeholders.length)}`, `${String(analysis.placeholders.length)} placeholder`))
+  }
+  if (analysis.references > 0) signals.push(`@${String(analysis.references)}`)
+  if (analysis.codeBlocks > 0) {
+    signals.push(label(`代码块 ${String(analysis.codeBlocks)}`, `${String(analysis.codeBlocks)} code`))
+  }
+  return createElement('div', { className: 'dsh-pw-strip' }, [
+    createElement('span', { key: 'score', className: 'dsh-pw-score' },
+      label('可执行度', 'Actionability'),
+      createElement('b', null, ` ${String(analysis.score)}`)),
+    createElement('span', { key: 'meter', className: 'dsh-pw-meter' },
+      createElement('span', { className: 'dsh-pw-meter-fill', style: { width: `${String(analysis.score)}%` } })),
+    createElement('span', { key: 'dims', className: 'dsh-pw-dims' }, dims),
+    signals.length === 0 ? null : createElement('span', { key: 'sig', className: 'dsh-pw-signals' }, signals.join(' · ')),
+  ])
+}
+
+/** The advice list, with one-click insertion of each snippet. */
+function suggestionList(
+  suggestions: readonly Suggestion[],
+  onInsert: (snippet: string) => void,
+): ReactNode {
+  if (suggestions.length === 0) {
+    return createElement('div', { className: 'dsh-pw-sugg' },
+      createElement('div', { className: 'dsh-pw-sugg-empty' }, '✓ 六个维度都有覆盖，没有发现需要补齐的项。'))
+  }
+  const rows = suggestions.map((suggestion) => createElement('div', {
+    key: suggestion.id,
+    className: 'dsh-pw-sugg-row',
+  }, [
+    createElement('span', {
+      key: 'sev',
+      className: `dsh-pw-sev dsh-pw-sev-${suggestion.severity}`,
+      title: suggestion.severity,
+    }),
+    createElement('span', { key: 'body', className: 'dsh-pw-sugg-body' }, [
+      createElement('span', { key: 't', className: 'dsh-pw-sugg-title' }, suggestion.title),
+      createElement('span', { key: 'd', className: 'dsh-pw-sugg-detail' }, suggestion.detail),
+    ]),
+    suggestion.snippet === undefined
+      ? null
+      : createElement('button', {
+        key: 'ins',
+        type: 'button',
+        className: 'dsh-pw-sugg-insert',
+        title: '把这节骨架插入到草稿末尾',
+        onClick: () => {
+          onInsert(suggestion.snippet as string)
+        },
+      }, '插入'),
+  ]))
+  return createElement('div', { className: 'dsh-pw-sugg' }, rows)
 }
 
 /**
@@ -141,7 +281,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     void tick()
   }, POLL_MS)
 
-  /** Kick off one enhancement run over the current draft buffer. */
+  /** Kick off one rewrite over the current draft buffer. */
   const run = async (): Promise<void> => {
     const snapshot = store.get()
     if (starting || snapshot.status === 'running') return
@@ -172,6 +312,15 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     void cancelRun(snapshot.taskId)
   }
 
+  /** Run the host's self-diagnosis and show it inline. */
+  const diagnose = (): void => {
+    store.set({ diagLoading: true, diagOpen: true })
+    void fetchDiag().then((report) => {
+      if (disposed) return
+      store.set({ diagLoading: false, diag: report })
+    })
+  }
+
   /** Subscribe one component to the shared store. Exactly two hooks, always. */
   function useStore(): WorkbenchState {
     const pair = useState<WorkbenchState>(store.get)
@@ -181,6 +330,21 @@ export function mountWorkbench(slots: SlotsLike): () => void {
       setSnapshot(store.get())
     }), [])
     return snapshot
+  }
+
+  /** Live, debounced analysis of the draft. */
+  function useAnalysis(text: string, mode: string, enabled: boolean): PromptAnalysis | null {
+    const [analysis, setAnalysis] = useState<PromptAnalysis | null>(null)
+    useEffect(() => {
+      if (!enabled) return
+      const handle = window.setTimeout(() => {
+        setAnalysis(analyzePrompt(text, mode))
+      }, ANALYZE_MS)
+      return () => {
+        window.clearTimeout(handle)
+      }
+    }, [text, mode, enabled])
+    return analysis
   }
 
   /** The one-click composer pill. */
@@ -199,7 +363,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     return createElement('button', {
       type: 'button',
       className: state.open ? 'dsh-pw-trigger dsh-pw-trigger-on' : 'dsh-pw-trigger',
-      title: '提示词增强 · 一键优化与润色',
+      title: '提示词增强 · 分析、重构建议与一键重写',
       'aria-label': '提示词增强',
       'aria-expanded': state.open ? 'true' : 'false',
       onMouseDown: (event: { preventDefault(): void }) => {
@@ -221,18 +385,45 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     const state = useStore()
     const useInput = props.useInput
     const draft = typeof useInput === 'function' ? useInput((input) => input.draft) : ''
-    const diffPair = useState(false)
-    const diffOn = diffPair[0]
-    const setDiffOn = diffPair[1]
+    const inputActions = props.inputActions
+    const resultRef = useRef<HTMLDivElement | null>(null)
+
+    const analysis = useAnalysis(state.source, state.mode, state.prefs.liveAnalysis)
+    const isZh = analysis !== null
+      ? analysis.language !== 'en'
+      : detectLanguage(state.source) !== 'en'
+
+    // Keep the newest streamed text in view without fighting a manual scroll.
+    useEffect(() => {
+      if (!state.prefs.autoScroll || state.status !== 'running') return
+      const node = resultRef.current
+      if (node !== null) node.scrollTop = node.scrollHeight
+    }, [state.output, state.status, state.prefs.autoScroll])
+
+    const insertSnippet = useCallback((snippet: string) => {
+      const current = store.get().source
+      const separator = current.trim() === '' ? '' : '\n\n'
+      store.set({ source: `${current}${separator}${snippet}`, note: '已插入结构骨架', error: '' })
+    }, [])
+
+    const setPrefs = useCallback((patch: Partial<Preferences>) => {
+      const next = { ...store.get().prefs, ...patch }
+      if (!savePreferences(next)) {
+        store.set({ prefs: next, note: '偏好已在本会话内生效，但浏览器拒绝持久化' })
+        return
+      }
+      store.set({ prefs: next })
+    }, [])
+
     if (!state.open) return null
 
-    const inputActions = props.inputActions
     const running = state.status === 'running'
     const done = state.status === 'done'
     const sourceChars = state.source.length
     const outputChars = state.output.length
     const activeMode = MODES.filter((entry) => entry.key === state.mode)[0] ?? MODES[0]
 
+    // ---- header -------------------------------------------------------------
     const headChildren: ReactNode[] = [
       createElement('span', { key: 'title', className: 'dsh-pw-title' },
         createElement('span', { className: 'dsh-pw-spark' }, '✦'),
@@ -244,6 +435,23 @@ export function mountWorkbench(slots: SlotsLike): () => void {
       }, `⚙ ${state.model}`))
     }
     headChildren.push(createElement('span', { key: 'spacer', className: 'dsh-pw-spacer' }))
+    headChildren.push(createElement('button', {
+      key: 'diag',
+      type: 'button',
+      className: 'dsh-pw-iconbtn',
+      title: '自检：查看插件在宿主侧的状态',
+      disabled: state.diagLoading,
+      onClick: diagnose,
+    }, '◎'))
+    headChildren.push(createElement('button', {
+      key: 'cfg',
+      type: 'button',
+      className: state.configOpen ? 'dsh-pw-iconbtn dsh-pw-iconbtn-on' : 'dsh-pw-iconbtn',
+      title: '设置',
+      onClick: () => {
+        store.set({ configOpen: !state.configOpen })
+      },
+    }, '⚙'))
     headChildren.push(createElement('button', {
       key: 'pull',
       type: 'button',
@@ -265,6 +473,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
       },
     }, '✕'))
 
+    // ---- mode bar -----------------------------------------------------------
     const tabs: ReactNode[] = MODES.map((entry) => createElement('button', {
       key: entry.key,
       type: 'button',
@@ -292,6 +501,101 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     ]))
     const hint = createElement('div', { className: 'dsh-pw-hint' }, activeMode.hint)
 
+    // ---- config panel -------------------------------------------------------
+    const configPanel = state.configOpen
+      ? createElement('div', { className: 'dsh-pw-cfg' }, [
+        createElement('label', { key: 'live', className: 'dsh-pw-cfg-row' }, [
+          createElement('input', {
+            key: 'i',
+            type: 'checkbox',
+            checked: state.prefs.liveAnalysis,
+            onChange: (event: { target: { checked: boolean } }) => {
+              setPrefs({ liveAnalysis: event.target.checked })
+            },
+          }),
+          createElement('span', { key: 't' }, '实时分析（本地、免费、随输入更新）'),
+        ]),
+        createElement('label', { key: 'sugg', className: 'dsh-pw-cfg-row' }, [
+          createElement('input', {
+            key: 'i',
+            type: 'checkbox',
+            checked: state.prefs.showSuggestions,
+            onChange: (event: { target: { checked: boolean } }) => {
+              setPrefs({ showSuggestions: event.target.checked })
+            },
+          }),
+          createElement('span', { key: 't' }, '显示重构建议'),
+        ]),
+        createElement('label', { key: 'scroll', className: 'dsh-pw-cfg-row' }, [
+          createElement('input', {
+            key: 'i',
+            type: 'checkbox',
+            checked: state.prefs.autoScroll,
+            onChange: (event: { target: { checked: boolean } }) => {
+              setPrefs({ autoScroll: event.target.checked })
+            },
+          }),
+          createElement('span', { key: 't' }, '生成时自动滚动到最新内容'),
+        ]),
+        createElement('label', { key: 'mode', className: 'dsh-pw-cfg-row' }, [
+          createElement('span', { key: 't', className: 'dsh-pw-cfg-label' }, '默认模式'),
+          createElement('select', {
+            key: 's',
+            className: 'dsh-pw-select',
+            value: state.prefs.defaultMode,
+            onChange: (event: { target: { value: string } }) => {
+              setPrefs({ defaultMode: event.target.value })
+            },
+          }, MODES.map((entry) => createElement('option', { key: entry.key, value: entry.key }, entry.label))),
+        ]),
+        createElement('label', { key: 'view', className: 'dsh-pw-cfg-row' }, [
+          createElement('span', { key: 't', className: 'dsh-pw-cfg-label' }, '默认结果视图'),
+          createElement('select', {
+            key: 's',
+            className: 'dsh-pw-select',
+            value: state.prefs.defaultView,
+            onChange: (event: { target: { value: string } }) => {
+              setPrefs({ defaultView: event.target.value as ResultView })
+            },
+          }, [
+            createElement('option', { key: 'result', value: 'result' }, '增强结果'),
+            createElement('option', { key: 'diff', value: 'diff' }, '差异对比'),
+            createElement('option', { key: 'outline', value: 'outline' }, '结构覆盖'),
+          ]),
+        ]),
+      ])
+      : null
+
+    // ---- diagnostics panel --------------------------------------------------
+    const diagPanel = state.diagOpen
+      ? createElement('div', { className: 'dsh-pw-diag' }, [
+        createElement('div', { key: 'h', className: 'dsh-pw-diag-head' }, [
+          createElement('span', { key: 't' }, '宿主侧自检'),
+          createElement('button', {
+            key: 'x',
+            type: 'button',
+            className: 'dsh-pw-iconbtn',
+            onClick: () => {
+              store.set({ diagOpen: false })
+            },
+          }, '✕'),
+        ]),
+        state.diagLoading
+          ? createElement('div', { key: 'l', className: 'dsh-pw-muted' }, '检测中…')
+          : state.diag === null
+            ? createElement('div', { key: 'n', className: 'dsh-pw-msg-err' }, '自检接口不可达（宿主半未响应）')
+            : createElement('div', { key: 'b' }, [
+              ...state.diag.checks.map((check) => createElement('div', {
+                key: check.id,
+                className: check.ok ? 'dsh-pw-diag-row dsh-pw-ok' : 'dsh-pw-diag-row dsh-pw-bad',
+              }, `${check.ok ? '✓' : '✗'} ${check.detail}`)),
+              createElement('div', { key: 'meta', className: 'dsh-pw-diag-meta' },
+                `node ${state.diag.node} · 启动图 ${state.diag.graphRev ?? '?'} · 模块 ${String(state.diag.moduleIds.length)} 个`),
+            ]),
+      ])
+      : null
+
+    // ---- left pane: the editable draft --------------------------------------
     const sourcePane = createElement('section', { className: 'dsh-pw-pane' },
       createElement('div', { className: 'dsh-pw-pane-head' },
         createElement('span', null, '原始提示词'),
@@ -299,7 +603,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
       createElement('textarea', {
         className: 'dsh-pw-input',
         value: state.source,
-        placeholder: '粘贴或输入提示词，中英文均可……\n\n也可以点右上角 ⭯ 直接读取输入框里的草稿。',
+        placeholder: '粘贴或输入提示词，中英文均可……\n\n也可以点右上角 ⭯ 直接读取输入框里的草稿。\n左侧输入会即时分析，下方给出重构建议。',
         spellCheck: false,
         onChange: (event: { target: { value: string } }) => {
           store.set({ source: event.target.value, error: '', note: '' })
@@ -317,37 +621,84 @@ export function mountWorkbench(slots: SlotsLike): () => void {
         },
       }))
 
+    // ---- right pane: one of three views -------------------------------------
+    const view = state.view
+    const viewSegment = createElement('span', { className: 'dsh-pw-seg' },
+      VIEWS.map(([key, label]) => createElement('button', {
+        key,
+        type: 'button',
+        className: view === key ? 'dsh-pw-seg-on' : undefined,
+        onClick: () => {
+          store.set({ view: key })
+        },
+      }, label)))
+
     const bodyChildren: ReactNode[] = []
-    if (state.output === '' && running) {
+    if (view === 'diff') {
+      if (state.output === '' || !done) {
+        bodyChildren.push(createElement('span', { key: 'd', className: 'dsh-pw-muted' }, '完成一次增强后可查看逐词差异。'))
+      } else {
+        const parts = computeDiff(state.source, state.output)
+        if (parts === null) {
+          bodyChildren.push(createElement('span', { key: 'plain' }, state.output))
+          bodyChildren.push(createElement('div', { key: 'cap', className: 'dsh-pw-muted' }, '（文本较长，已跳过逐词差异高亮）'))
+        } else {
+          for (const [index, part] of parts.entries()) {
+            const className = part.kind === 'add' ? 'dsh-pw-add' : part.kind === 'del' ? 'dsh-pw-del' : 'dsh-pw-same'
+            bodyChildren.push(createElement('span', { key: String(index), className }, part.text))
+          }
+        }
+      }
+    } else if (view === 'outline') {
+      const target = state.output === '' ? state.source : state.output
+      const outlineAnalysis = analyzePrompt(target, state.mode)
+      if (outlineAnalysis.outline.length === 0) {
+        bodyChildren.push(createElement('span', { key: 'none', className: 'dsh-pw-muted' },
+          '当前模式不追加结构骨架（精简表达只做删减）。'))
+      } else {
+        for (const section of outlineAnalysis.outline) {
+          const covered = target.includes(section.heading)
+          bodyChildren.push(createElement('div', {
+            key: section.id,
+            className: covered ? 'dsh-pw-outline-row dsh-pw-ok' : 'dsh-pw-outline-row dsh-pw-bad',
+          }, `${covered ? '✓' : '○'} ${section.heading} — ${section.hint}`))
+        }
+      }
+    } else if (state.output === '' && running) {
       bodyChildren.push(createElement('span', { key: 'wait', className: 'dsh-pw-muted' }, '正在思考…'))
     } else if (state.output === '') {
       bodyChildren.push(createElement('span', { key: 'idle', className: 'dsh-pw-muted' }, '增强结果会在这里流式出现。'))
-    } else if (diffOn && done) {
-      const parts = computeDiff(state.source, state.output)
-      if (parts === null) {
-        bodyChildren.push(createElement('span', { key: 'plain' }, state.output))
-        bodyChildren.push(createElement('div', { key: 'cap', className: 'dsh-pw-muted' }, '（文本较长，已跳过逐词差异高亮）'))
-      } else {
-        for (const [index, part] of parts.entries()) {
-          const className = part.kind === 'add' ? 'dsh-pw-add' : part.kind === 'del' ? 'dsh-pw-del' : 'dsh-pw-same'
-          bodyChildren.push(createElement('span', { key: String(index), className }, part.text))
-        }
-      }
     } else {
-      bodyChildren.push(createElement('span', {
-        key: 'live',
-        className: running ? 'dsh-pw-caret' : undefined,
-      }, state.output))
+      const blocks = splitBlocks(state.output)
+      for (const [index, block] of blocks.entries()) {
+        const className = block.kind === 'heading'
+          ? 'dsh-pw-block dsh-pw-block-h'
+          : block.kind === 'code'
+            ? 'dsh-pw-block dsh-pw-block-code'
+            : block.kind === 'list'
+              ? 'dsh-pw-block dsh-pw-block-list'
+              : 'dsh-pw-block'
+        const tail = running && index === blocks.length - 1 ? ' dsh-pw-caret' : ''
+        bodyChildren.push(createElement('div', { key: String(index), className: `${className}${tail}` }, block.text))
+      }
     }
 
     const outputPane = createElement('section', { className: 'dsh-pw-pane' },
       createElement('div', { className: 'dsh-pw-pane-head' },
-        createElement('span', null, done && diffOn ? '差异对比（新增高亮 / 删除划线）' : '增强结果'),
+        createElement('span', null, view === 'diff' ? '差异对比' : view === 'outline' ? '结构覆盖' : '增强结果'),
+        createElement('span', { className: 'dsh-pw-spacer' }),
+        viewSegment,
         createElement('span', { className: 'dsh-pw-count' }, `${String(outputChars)} 字符`)),
-      createElement('div', { className: 'dsh-pw-body' }, bodyChildren))
+      createElement('div', { className: 'dsh-pw-body', ref: resultRef }, bodyChildren))
 
     const grid = createElement('div', { className: 'dsh-pw-grid' }, [sourcePane, outputPane])
 
+    // ---- advice -------------------------------------------------------------
+    const advice = state.prefs.showSuggestions && analysis !== null
+      ? suggestionList(analysis.suggestions, insertSnippet)
+      : null
+
+    // ---- footer -------------------------------------------------------------
     const canWrite = inputActions !== undefined && typeof inputActions.setDraft === 'function' && state.output !== ''
     const footChildren: ReactNode[] = []
     if (running) {
@@ -404,17 +755,6 @@ export function mountWorkbench(slots: SlotsLike): () => void {
         )
       },
     }, '复制'))
-    if (done) {
-      footChildren.push(createElement('button', {
-        key: 'diff',
-        type: 'button',
-        className: diffOn ? 'dsh-pw-btn dsh-pw-btn-primary' : 'dsh-pw-btn',
-        title: '高亮显示新增与删除的片段',
-        onClick: () => {
-          setDiffOn(!diffOn)
-        },
-      }, '差异高亮'))
-    }
     const seconds = (state.elapsedMs / 1000).toFixed(1)
     const statusText = running
       ? `生成中 · ${seconds}s · ${String(outputChars)} 字符`
@@ -425,7 +765,24 @@ export function mountWorkbench(slots: SlotsLike): () => void {
 
     const messages: ReactNode[] = []
     if (state.error !== '') {
-      messages.push(createElement('div', { key: 'err', className: 'dsh-pw-msg dsh-pw-msg-err' }, `⚠ ${state.error}`))
+      messages.push(createElement('div', { key: 'err', className: 'dsh-pw-msg dsh-pw-msg-err' }, [
+        createElement('span', { key: 't' }, `⚠ ${state.error}`),
+        createElement('button', {
+          key: 'retry',
+          type: 'button',
+          className: 'dsh-pw-btn dsh-pw-btn-tiny',
+          disabled: running,
+          onClick: () => {
+            void run()
+          },
+        }, '重试'),
+        createElement('button', {
+          key: 'diag',
+          type: 'button',
+          className: 'dsh-pw-btn dsh-pw-btn-tiny',
+          onClick: diagnose,
+        }, '自检'),
+      ]))
     }
     if (state.note !== '') {
       messages.push(createElement('div', { key: 'note', className: 'dsh-pw-msg dsh-pw-msg-ok' }, `✓ ${state.note}`))
@@ -437,7 +794,11 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     }, [
       createElement('div', { key: 'head', className: 'dsh-pw-head' }, headChildren),
       createElement('div', { key: 'barwrap' }, [bar, hint]),
-      grid,
+      configPanel === null ? null : createElement('div', { key: 'cfg' }, configPanel),
+      diagPanel === null ? null : createElement('div', { key: 'diag' }, diagPanel),
+      analysis === null ? null : createElement('div', { key: 'strip' }, analysisStrip(analysis, isZh)),
+      createElement('div', { key: 'gridwrap' }, grid),
+      advice === null ? null : createElement('div', { key: 'advice' }, advice),
       messages.length === 0 ? null : createElement('div', { key: 'msgs' }, messages),
       createElement('div', { key: 'foot' }, footChildren),
     ])
@@ -456,6 +817,10 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     if (typeof props.useInput !== 'function') return null
     return createElement(Panel, props)
   }
+
+  // Seed session state from the persisted preferences once, at mount.
+  const prefs = loadPreferences()
+  store.set({ mode: prefs.defaultMode, lang: prefs.defaultLang, view: prefs.defaultView, prefs })
 
   const offLeft = slots.inject('conversation.input.left', () => slots.register(
     { name: 'conversation.input.left', id: 'prompt-workbench-trigger', order: 20, label: '提示词增强' },

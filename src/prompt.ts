@@ -58,10 +58,16 @@ export function outputLanguage(language: OutputLanguage, source: string): 'zh' |
  *
  * Rules 1–4 protect the user: the model must not answer the prompt, must not
  * invent facts, and must leave placeholders and code blocks untouched.
+ *
+ * @param mode - the active rewrite mode.
+ * @param outLang - the resolved output language.
+ * @param gaps - an optional pre-computed gap report from `analyzePrompt`, so the
+ *   rewrite targets the dimensions this draft actually lacks instead of
+ *   applying the same generic treatment to every draft.
  */
-export function buildSystemInstruction(mode: RewriteMode, outLang: 'zh' | 'en'): string {
+export function buildSystemInstruction(mode: RewriteMode, outLang: 'zh' | 'en', gaps = ''): string {
   const guide = MODE_GUIDE[mode] ?? MODE_GUIDE.refine
-  return [
+  const lines = [
     'You are a senior prompt engineer. Rewrite the draft prompt the user supplies so that an AI coding agent can act on it precisely, without guessing.',
     '',
     'Hard rules:',
@@ -75,7 +81,15 @@ export function buildSystemInstruction(mode: RewriteMode, outLang: 'zh' | 'en'):
     '8. Do not add a section that merely restates these instructions.',
     '',
     `Rewrite mode — ${guide}`,
-  ].join('\n')
+  ]
+  if (gaps !== '') {
+    lines.push(
+      '',
+      'A deterministic analysis of this draft found the following. Close these gaps inside the rewrite:',
+      gaps,
+    )
+  }
+  return lines.join('\n')
 }
 
 /** Normalize any thrown value into a printable message. */

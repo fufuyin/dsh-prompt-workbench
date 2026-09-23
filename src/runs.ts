@@ -17,9 +17,17 @@ import {
   normalizeMode,
   outputLanguage,
 } from './prompt.ts'
+import { analyzePrompt, describeGapsForModel } from './analyze.ts'
 
 /** Bounded task table: finished runs are reaped before live ones. */
 const MAX_TASKS = 8
+
+/**
+ * Wall-clock ceiling for one model call. A stream that never settles must not
+ * pin a task slot forever; the run is aborted with a distinguishable error so
+ * the UI can say "timed out" rather than "stopped".
+ */
+const RUN_TIMEOUT_MS = 180_000
 
 /** One stream chunk, read structurally so the port carries no internal types. */
 interface StreamChunkLike {
@@ -94,6 +102,8 @@ interface Run {
   error: string | undefined
   readonly controller: AbortController
   readonly startedAt: number
+  /** Set by the wall-clock guard so a timeout reads differently from a cancel. */
+  timedOut: boolean
 }
 
 /** The live default model route, or null when nothing is selected. */
@@ -170,6 +180,7 @@ export class RunRegistry {
       error: undefined,
       controller: new AbortController(),
       startedAt: Date.now(),
+      timedOut: false,
     }
     this.#runs.set(id, run)
     this.#reap()
@@ -240,12 +251,23 @@ export class RunRegistry {
       run.error = '当前没有可用的默认模型路由'
       return
     }
+    // Deterministic gap report: this is what turns a generic "improve it" into a
+    // rewrite that closes the dimensions this particular draft is missing.
+    const analysis = analyzePrompt(run.source, mode)
+    const guard = setTimeout(() => {
+      run.timedOut = true
+      run.controller.abort()
+    }, RUN_TIMEOUT_MS)
     try {
       const stream = llm.stream({
         provider: route.provider,
         model: route.model,
         ...route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort },
-        system: buildSystemInstruction(mode, outputLanguage(lang, run.source)),
+        system: buildSystemInstruction(
+          mode,
+          outputLanguage(lang, run.source),
+          describeGapsForModel(analysis),
+        ),
         // Built inline rather than through the llm package's `createUserMessage`
         // helper: the shape is identical to what the original implementation
         // sent, and it keeps this plugin free of runtime dependencies.
@@ -279,9 +301,16 @@ export class RunRegistry {
       } else {
         run.error = errorMessage(error)
       }
+    } finally {
+      clearTimeout(guard)
     }
     if (this.#disposed) return
     if (run.controller.signal.aborted) {
+      if (run.timedOut) {
+        run.status = 'error'
+        run.error = `模型调用超时（${String(RUN_TIMEOUT_MS / 1000)} 秒未返回），已中止。`
+        return
+      }
       run.status = 'stopped'
       return
     }
