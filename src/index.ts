@@ -26,7 +26,7 @@
 import { existsSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
-import { queryParam, readJsonBody, sameOrigin, sendJson } from './http.ts'
+import { inspectOrigin, queryParam, readJsonBody, sendJson } from './http.ts'
 import { RunRegistry, type HostServices } from './runs.ts'
 import { errorMessage } from './prompt.ts'
 import { API_VERSION } from './protocol.ts'
@@ -43,6 +43,33 @@ interface DiagCheck {
   readonly ok: boolean
   readonly detail: string
 }
+
+/**
+ * One observed request, kept for the diagnostics ring.
+ *
+ * Plugin routes are invisible in the session log: a `403` from the same-origin
+ * gate, or a `404` for a route a stale host half does not have, leaves no trace
+ * anywhere the author can look. That silence is exactly why a failing browser
+ * call could not be told apart from a plugin that never rendered.
+ *
+ * Recording the last few requests — with the raw `Origin` / `Host` /
+ * `Sec-Fetch-Site` values and the verdict drawn from them — makes the browser's
+ * side of the conversation observable through `/diag`.
+ */
+interface RequestRecord {
+  readonly at: string
+  readonly method: string
+  readonly path: string
+  readonly status: number
+  readonly ms: number
+  readonly origin: string
+  readonly host: string
+  readonly secFetchSite: string
+  readonly originVerdict: string
+}
+
+/** How many recent requests the ring retains. Small on purpose: it is a hint. */
+const REQUEST_RING_SIZE = 24
 
 /**
  * The slice of the host `clientModules` service the diagnostics route reads.
@@ -89,11 +116,51 @@ export function apply(ctx: Context): void {
 
   const registry = new RunRegistry(host as HostServices)
 
+  /** The request ring served by `/diag`; newest last, bounded, in-memory only. */
+  const recent: RequestRecord[] = []
+
+  /**
+   * Register one route behind the observation ring.
+   *
+   * Every plugin route goes through here so the ring sees a request whether it
+   * succeeded, was refused by the origin gate, or threw.
+   */
   const route = (
     kind: 'exact' | 'prefix',
     path: string,
     handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
-  ): (() => void) => webServer.register({ kind, path, handler })
+  ): (() => void) => webServer.register({
+    kind,
+    path,
+    handler: async (request, response) => {
+      const startedAt = Date.now()
+      const verdict = inspectOrigin(request)
+      let note: string | undefined
+      try {
+        await handler(request, response)
+      } catch (error) {
+        note = errorMessage(error)
+        if (!response.headersSent) {
+          sendJson(response, 500, { ok: false, code: 'handler', message: note })
+        }
+      }
+      recent.push({
+        at: new Date().toISOString(),
+        method: request.method ?? '',
+        path,
+        // Node's writeHead assigns statusCode, so the handler's own status is
+        // readable here without intercepting anything.
+        status: response.statusCode,
+        ms: Date.now() - startedAt,
+        origin: verdict.origin,
+        host: verdict.host,
+        secFetchSite: verdict.secFetchSite,
+        originVerdict: verdict.reason,
+        ...note === undefined ? {} : { note },
+      })
+      while (recent.length > REQUEST_RING_SIZE) recent.shift()
+    },
+  })
 
   /**
    * `GET /meta` — the model route in force, the host-side limits, and this
@@ -111,15 +178,26 @@ export function apply(ctx: Context): void {
       response.end()
       return
     }
-    if (!sameOrigin(request)) {
-      sendJson(response, 403, { ok: false, code: 'origin', message: 'untrusted origin' })
+    if (!inspectOrigin(request).ok) {
+      const verdict = inspectOrigin(request)
+      sendJson(response, 403, {
+        ok: false,
+        code: 'origin',
+        message: 'untrusted origin',
+        detail: {
+          verdict: verdict.reason,
+          origin: verdict.origin,
+          host: verdict.host,
+          secFetchSite: verdict.secFetchSite,
+        },
+      })
       return
     }
     let body: unknown
     try {
       body = await readJsonBody(request)
     } catch (error) {
-      sendJson(response, 400, { ok: false, code: 'body', message: error instanceof Error ? error.message : 'bad body' })
+      sendJson(response, 400, { ok: false, code: 'body', message: errorMessage(error) })
       return
     }
     const fields = body !== null && typeof body === 'object' ? body as Record<string, unknown> : {}
@@ -131,7 +209,10 @@ export function apply(ctx: Context): void {
   const poll = route('exact', `${API}/poll`, (request, response) => {
     const id = queryParam(request, 'id')
     if (id === undefined) {
-      sendJson(response, 400, { ok: false, code: 'id', message: 'missing id' })
+      // The message names the exact missing field; the client surfaces it
+      // verbatim, so a malformed poll URL is self-describing rather than a
+      // generic failure.
+      sendJson(response, 400, { ok: false, code: 'id', message: 'missing id（轮询请求缺少 id 参数）' })
       return
     }
     const rawCursor = queryParam(request, 'cursor')
@@ -151,7 +232,7 @@ export function apply(ctx: Context): void {
       response.end()
       return
     }
-    if (!sameOrigin(request)) {
+    if (!inspectOrigin(request).ok) {
       sendJson(response, 403, { ok: false, code: 'origin', message: 'untrusted origin' })
       return
     }
@@ -258,6 +339,10 @@ export function apply(ctx: Context): void {
       clientPath,
       clientBundleExists,
       checks,
+      // Newest last. A 403 here with `originVerdict` evidence, or a 404 on a
+      // route this build should own, is the fastest way to tell a browser-side
+      // failure from a stale host build.
+      recentRequests: recent.slice(-REQUEST_RING_SIZE),
     })
   })
 

@@ -9,11 +9,23 @@
 /** The plugin's route namespace, matching the host half. */
 const API = '/dsh-prompt-workbench/api'
 
-/** Resolve a route against the document base. */
+/**
+ * Resolve a route against the document base.
+ *
+ * **The search string must survive.** Returning only `pathname` silently drops
+ * `?id=…&cursor=…`, which turned every poll into a request without an id — the
+ * host answered "missing id", the panel showed that verbatim, and no rewrite
+ * ever produced output. The bug was invisible because the request itself was
+ * perfectly well formed; only its query was gone.
+ *
+ * @param path - route path, optionally carrying a query string.
+ * @returns a path-absolute URL, query intact.
+ */
 export function api(path: string): string {
   const relative = path.replace(/^\/+/, '')
   if (typeof document === 'undefined') return `/${relative}`
-  return new URL(relative, document.baseURI).pathname
+  const url = new URL(relative, document.baseURI)
+  return `${url.pathname}${url.search}`
 }
 
 /** What `/meta` answers. */
