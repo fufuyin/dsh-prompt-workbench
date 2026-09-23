@@ -357,6 +357,20 @@ window.__ModuleLoader__.load({
 				outline
 			};
 		}
+		/**
+		* Explain a version mismatch in one sentence.
+		*
+		* Deliberately accepts `unknown` for the host value: the interesting case is an
+		* *older* host that predates this field entirely and therefore reports nothing.
+		*
+		* @param hostVersion - whatever the host reported, if anything.
+		* @param clientVersion - the browser half's own version.
+		* @returns an empty string when they agree; otherwise the explanation to show.
+		*/
+		function describeDrift(hostVersion, clientVersion) {
+			if (hostVersion === clientVersion) return "";
+			return `宿主半与界面版本不一致（host ${typeof hostVersion !== "number" ? "未上报" : hostVersion === -1 ? "未上报版本（旧构建）" : `v${String(hostVersion)}`} / client v${String(clientVersion)}）。磁盘上的构建已经更新，但运行中的 profile 仍在用启动时加载的旧代码——重启 profile 即可生效。`;
+		}
 		//#endregion
 		//#region src/client/api.ts
 		/**
@@ -395,10 +409,19 @@ window.__ModuleLoader__.load({
 		async function fetchDiag() {
 			try {
 				const response = await fetch(api(`${API}/diag`));
-				if (!response.ok) return null;
-				return await response.json();
-			} catch {
-				return null;
+				if (!response.ok) return {
+					kind: "missing",
+					status: response.status
+				};
+				return {
+					kind: "ok",
+					report: await response.json()
+				};
+			} catch (error) {
+				return {
+					kind: "error",
+					message: error instanceof Error ? error.message : "network error"
+				};
 			}
 		}
 		/** Begin one rewrite. */
@@ -641,7 +664,8 @@ window.__ModuleLoader__.load({
 				configOpen: false,
 				diagOpen: false,
 				diagLoading: false,
-				diag: null
+				diag: null,
+				hostApiVersion: null
 			};
 		}
 		//#endregion
@@ -853,6 +877,47 @@ window.__ModuleLoader__.load({
 			return (0, react.createElement)("div", { className: "dsh-pw-sugg" }, rows);
 		}
 		/**
+		* The diagnostics block's body.
+		*
+		* The three failure kinds are spelled out separately because they have three
+		* different causes, and collapsing them into one "unreachable" line is exactly
+		* what sent the author chasing the wrong problem: a route that 404s means the
+		* running host is an older build, not that the carrier is broken.
+		*/
+		function diagBody(loading, outcome) {
+			if (loading) return (0, react.createElement)("div", { className: "dsh-pw-muted" }, "检测中…");
+			if (outcome === null) return (0, react.createElement)("div", { className: "dsh-pw-muted" }, "尚未自检。");
+			if (outcome.kind === "error") return (0, react.createElement)("div", { className: "dsh-pw-msg-err" }, `✗ 自检请求未送达：${outcome.message}`);
+			if (outcome.kind === "missing") return (0, react.createElement)("div", null, [(0, react.createElement)("div", {
+				key: "r",
+				className: "dsh-pw-diag-row dsh-pw-bad"
+			}, `✗ 自检路由返回 HTTP ${String(outcome.status)}：运行中的宿主半没有这条路由。`), (0, react.createElement)("div", {
+				key: "h",
+				className: "dsh-pw-diag-meta"
+			}, "这通常不是故障，而是版本漂移——界面用的是新构建，宿主半仍是 profile 启动时加载的旧代码。重启 profile 即可。")]);
+			const report = outcome.report;
+			return (0, react.createElement)("div", null, [...report.checks.map((check) => (0, react.createElement)("div", {
+				key: check.id,
+				className: check.ok ? "dsh-pw-diag-row dsh-pw-ok" : "dsh-pw-diag-row dsh-pw-bad"
+			}, `${check.ok ? "✓" : "✗"} ${check.detail}`)), (0, react.createElement)("div", {
+				key: "meta",
+				className: "dsh-pw-diag-meta"
+			}, `host v${String(report.apiVersion ?? -1)} / client v${String(2)} · node ${report.node} · 启动图 ${report.graphRev ?? "?"} · 模块 ${String(report.moduleIds.length)} 个`)]);
+		}
+		/**
+		* A banner when the two halves report different wire revisions.
+		*
+		* The halves do not reload together — the browser bundle is served fresh while
+		* the host half is imported once at boot — so this is a normal state after
+		* rebuilding, and it must say so rather than look like a bug.
+		*/
+		function driftBanner(hostVersion) {
+			if (hostVersion === null) return null;
+			const text = describeDrift(hostVersion, 2);
+			if (text === "") return null;
+			return (0, react.createElement)("div", { className: "dsh-pw-drift" }, `⚠ ${text}`);
+		}
+		/**
 		* Mount both surfaces over one shared store and one shared poller.
 		* @returns a disposer that removes every registration and stops the poller.
 		*/
@@ -871,6 +936,7 @@ window.__ModuleLoader__.load({
 					store.set({
 						provider: typeof meta.provider === "string" ? meta.provider : "",
 						model: typeof meta.model === "string" ? meta.model : "",
+						hostApiVersion: typeof meta.apiVersion === "number" ? meta.apiVersion : -1,
 						...meta.available === true ? {} : { error: "llm 服务不可用，无法调用模型" }
 					});
 				});
@@ -984,11 +1050,11 @@ window.__ModuleLoader__.load({
 					diagLoading: true,
 					diagOpen: true
 				});
-				fetchDiag().then((report) => {
+				fetchDiag().then((outcome) => {
 					if (disposed) return;
 					store.set({
 						diagLoading: false,
-						diag: report
+						diag: outcome
 					});
 				});
 			};
@@ -1279,19 +1345,7 @@ window.__ModuleLoader__.load({
 					onClick: () => {
 						store.set({ diagOpen: false });
 					}
-				}, "✕")]), state.diagLoading ? (0, react.createElement)("div", {
-					key: "l",
-					className: "dsh-pw-muted"
-				}, "检测中…") : state.diag === null ? (0, react.createElement)("div", {
-					key: "n",
-					className: "dsh-pw-msg-err"
-				}, "自检接口不可达（宿主半未响应）") : (0, react.createElement)("div", { key: "b" }, [...state.diag.checks.map((check) => (0, react.createElement)("div", {
-					key: check.id,
-					className: check.ok ? "dsh-pw-diag-row dsh-pw-ok" : "dsh-pw-diag-row dsh-pw-bad"
-				}, `${check.ok ? "✓" : "✗"} ${check.detail}`)), (0, react.createElement)("div", {
-					key: "meta",
-					className: "dsh-pw-diag-meta"
-				}, `node ${state.diag.node} · 启动图 ${state.diag.graphRev ?? "?"} · 模块 ${String(state.diag.moduleIds.length)} 个`)])]) : null;
+				}, "✕")]), diagBody(state.diagLoading, state.diag)]) : null;
 				const sourcePane = (0, react.createElement)("section", { className: "dsh-pw-pane" }, (0, react.createElement)("div", { className: "dsh-pw-pane-head" }, (0, react.createElement)("span", null, "原始提示词"), (0, react.createElement)("span", { className: "dsh-pw-count" }, `${String(sourceChars)} 字符`)), (0, react.createElement)("textarea", {
 					className: "dsh-pw-input",
 					value: state.source,
@@ -1481,6 +1535,7 @@ window.__ModuleLoader__.load({
 						className: "dsh-pw-head"
 					}, headChildren),
 					(0, react.createElement)("div", { key: "barwrap" }, [bar, hint]),
+					driftBanner(state.hostApiVersion),
 					configPanel === null ? null : (0, react.createElement)("div", { key: "cfg" }, configPanel),
 					diagPanel === null ? null : (0, react.createElement)("div", { key: "diag" }, diagPanel),
 					analysis === null ? null : (0, react.createElement)("div", { key: "strip" }, analysisStrip(analysis, isZh)),
@@ -1681,6 +1736,14 @@ window.__ModuleLoader__.load({
 .dsh-pw-msg-err { color: var(--dsw-alias-state-error-primary); }
 .dsh-pw-msg-ok { color: var(--dsw-alias-state-success-primary); }
 
+/* Version-drift banner: the halves reload separately, so this is normal. */
+.dsh-pw-drift {
+  margin: 10px 14px 0; padding: 8px 10px; border-radius: 10px;
+  font-size: 11.5px; line-height: 1.55;
+  color: var(--dsw-alias-state-warn-primary);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, transparent);
+}
 .dsh-pw-iconbtn-on {
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
   color: var(--dsw-alias-brand-primary);

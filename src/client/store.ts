@@ -7,7 +7,7 @@
  * actually changed.
  */
 
-import type { DiagReport } from './api.ts'
+import type { DiagOutcome } from './api.ts'
 import { DEFAULT_PREFERENCES, type Preferences, type ResultView } from './prefs.ts'
 
 /** One rewrite run's lifecycle. */
@@ -51,8 +51,13 @@ export interface WorkbenchState {
   readonly diagOpen: boolean
   /** A diagnostics read is in flight. */
   readonly diagLoading: boolean
-  /** The last diagnostics answer, or null before the first read. */
-  readonly diag: DiagReport | null
+  /** The last diagnostics outcome, or null before the first read. */
+  readonly diag: DiagOutcome | null
+  /**
+   * The host half's reported wire revision, or null when it reported none —
+   * which means the running host predates the field and is an older build.
+   */
+  readonly hostApiVersion: number | null
 }
 
 /** A store over one state shape. */
@@ -118,5 +123,6 @@ export function initialState(): WorkbenchState {
     diagOpen: false,
     diagLoading: false,
     diag: null,
+    hostApiVersion: null,
   }
 }

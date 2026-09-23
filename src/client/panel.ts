@@ -27,7 +27,8 @@
 
 import { createElement, useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { analyzePrompt, detectLanguage, type PromptAnalysis, type Suggestion } from '../analyze.ts'
-import { cancelRun, fetchDiag, fetchMeta, pollRun, startRun } from './api.ts'
+import { API_VERSION, describeDrift, LEGACY_HOST_VERSION } from '../protocol.ts'
+import { cancelRun, fetchDiag, fetchMeta, pollRun, startRun, type DiagOutcome } from './api.ts'
 import { computeDiff, stripOuterFence } from './diff.ts'
 import { loadPreferences, savePreferences, type Preferences, type ResultView } from './prefs.ts'
 import { createStore, initialState, type WorkbenchState } from './store.ts'
@@ -216,6 +217,54 @@ function suggestionList(
 }
 
 /**
+ * The diagnostics block's body.
+ *
+ * The three failure kinds are spelled out separately because they have three
+ * different causes, and collapsing them into one "unreachable" line is exactly
+ * what sent the author chasing the wrong problem: a route that 404s means the
+ * running host is an older build, not that the carrier is broken.
+ */
+function diagBody(loading: boolean, outcome: DiagOutcome | null): ReactNode {
+  if (loading) return createElement('div', { className: 'dsh-pw-muted' }, '检测中…')
+  if (outcome === null) return createElement('div', { className: 'dsh-pw-muted' }, '尚未自检。')
+  if (outcome.kind === 'error') {
+    return createElement('div', { className: 'dsh-pw-msg-err' }, `✗ 自检请求未送达：${outcome.message}`)
+  }
+  if (outcome.kind === 'missing') {
+    return createElement('div', null, [
+      createElement('div', { key: 'r', className: 'dsh-pw-diag-row dsh-pw-bad' },
+        `✗ 自检路由返回 HTTP ${String(outcome.status)}：运行中的宿主半没有这条路由。`),
+      createElement('div', { key: 'h', className: 'dsh-pw-diag-meta' },
+        '这通常不是故障，而是版本漂移——界面用的是新构建，宿主半仍是 profile 启动时加载的旧代码。重启 profile 即可。'),
+    ])
+  }
+  const report = outcome.report
+  return createElement('div', null, [
+    ...report.checks.map((check) => createElement('div', {
+      key: check.id,
+      className: check.ok ? 'dsh-pw-diag-row dsh-pw-ok' : 'dsh-pw-diag-row dsh-pw-bad',
+    }, `${check.ok ? '✓' : '✗'} ${check.detail}`)),
+    createElement('div', { key: 'meta', className: 'dsh-pw-diag-meta' },
+      `host v${String(report.apiVersion ?? LEGACY_HOST_VERSION)} / client v${String(API_VERSION)}`
+      + ` · node ${report.node} · 启动图 ${report.graphRev ?? '?'} · 模块 ${String(report.moduleIds.length)} 个`),
+  ])
+}
+
+/**
+ * A banner when the two halves report different wire revisions.
+ *
+ * The halves do not reload together — the browser bundle is served fresh while
+ * the host half is imported once at boot — so this is a normal state after
+ * rebuilding, and it must say so rather than look like a bug.
+ */
+function driftBanner(hostVersion: number | null): ReactNode {
+  if (hostVersion === null) return null
+  const text = describeDrift(hostVersion, API_VERSION)
+  if (text === '') return null
+  return createElement('div', { className: 'dsh-pw-drift' }, `⚠ ${text}`)
+}
+
+/**
  * Mount both surfaces over one shared store and one shared poller.
  * @returns a disposer that removes every registration and stops the poller.
  */
@@ -235,6 +284,9 @@ export function mountWorkbench(slots: SlotsLike): () => void {
       store.set({
         provider: typeof meta.provider === 'string' ? meta.provider : '',
         model: typeof meta.model === 'string' ? meta.model : '',
+        // A reported number, or the "predates versioning" sentinel — either way
+        // the answer is now known, so drift can be judged.
+        hostApiVersion: typeof meta.apiVersion === 'number' ? meta.apiVersion : LEGACY_HOST_VERSION,
         ...meta.available === true ? {} : { error: 'llm 服务不可用，无法调用模型' },
       })
     })
@@ -315,9 +367,9 @@ export function mountWorkbench(slots: SlotsLike): () => void {
   /** Run the host's self-diagnosis and show it inline. */
   const diagnose = (): void => {
     store.set({ diagLoading: true, diagOpen: true })
-    void fetchDiag().then((report) => {
+    void fetchDiag().then((outcome) => {
       if (disposed) return
-      store.set({ diagLoading: false, diag: report })
+      store.set({ diagLoading: false, diag: outcome })
     })
   }
 
@@ -580,18 +632,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
             },
           }, '✕'),
         ]),
-        state.diagLoading
-          ? createElement('div', { key: 'l', className: 'dsh-pw-muted' }, '检测中…')
-          : state.diag === null
-            ? createElement('div', { key: 'n', className: 'dsh-pw-msg-err' }, '自检接口不可达（宿主半未响应）')
-            : createElement('div', { key: 'b' }, [
-              ...state.diag.checks.map((check) => createElement('div', {
-                key: check.id,
-                className: check.ok ? 'dsh-pw-diag-row dsh-pw-ok' : 'dsh-pw-diag-row dsh-pw-bad',
-              }, `${check.ok ? '✓' : '✗'} ${check.detail}`)),
-              createElement('div', { key: 'meta', className: 'dsh-pw-diag-meta' },
-                `node ${state.diag.node} · 启动图 ${state.diag.graphRev ?? '?'} · 模块 ${String(state.diag.moduleIds.length)} 个`),
-            ]),
+        diagBody(state.diagLoading, state.diag),
       ])
       : null
 
@@ -794,6 +835,7 @@ export function mountWorkbench(slots: SlotsLike): () => void {
     }, [
       createElement('div', { key: 'head', className: 'dsh-pw-head' }, headChildren),
       createElement('div', { key: 'barwrap' }, [bar, hint]),
+      driftBanner(state.hostApiVersion),
       configPanel === null ? null : createElement('div', { key: 'cfg' }, configPanel),
       diagPanel === null ? null : createElement('div', { key: 'diag' }, diagPanel),
       analysis === null ? null : createElement('div', { key: 'strip' }, analysisStrip(analysis, isZh)),

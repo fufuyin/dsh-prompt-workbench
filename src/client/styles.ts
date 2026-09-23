@@ -149,6 +149,14 @@ export const WORKBENCH_CSS = `
 .dsh-pw-msg-err { color: var(--dsw-alias-state-error-primary); }
 .dsh-pw-msg-ok { color: var(--dsw-alias-state-success-primary); }
 
+/* Version-drift banner: the halves reload separately, so this is normal. */
+.dsh-pw-drift {
+  margin: 10px 14px 0; padding: 8px 10px; border-radius: 10px;
+  font-size: 11.5px; line-height: 1.55;
+  color: var(--dsw-alias-state-warn-primary);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, transparent);
+}
 .dsh-pw-iconbtn-on {
   background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
   color: var(--dsw-alias-brand-primary);

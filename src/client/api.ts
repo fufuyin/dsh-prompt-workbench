@@ -24,6 +24,11 @@ export interface WorkbenchMeta {
   readonly model: string | null
   readonly maxInputChars: number
   readonly modes: readonly string[]
+  /**
+   * The host half's wire revision. Absent when the running host predates the
+   * field, which is itself the signal that it is an older build.
+   */
+  readonly apiVersion?: number
 }
 
 /** One poll answer. */
@@ -72,6 +77,7 @@ export interface DiagCheck {
 export interface DiagReport {
   readonly ok: boolean
   readonly package: string
+  readonly apiVersion?: number
   readonly node: string
   readonly graphRev: string | null
   readonly moduleIds: readonly string[]
@@ -81,6 +87,19 @@ export interface DiagReport {
 }
 
 /**
+ * The result of a diagnostics read.
+ *
+ * The failure kinds are kept apart on purpose. "The route answered 404" and
+ * "the request never landed" have completely different causes — a stale host
+ * build versus a dead carrier — and collapsing them into one "unreachable"
+ * message is what sent the author chasing the wrong problem the first time.
+ */
+export type DiagOutcome =
+  | { readonly kind: 'ok'; readonly report: DiagReport }
+  | { readonly kind: 'missing'; readonly status: number }
+  | { readonly kind: 'error'; readonly message: string }
+
+/**
  * Ask the host how it sees this plugin's browser half.
  *
  * This exists because the browser half can fail invisibly: if its module never
@@ -88,13 +107,13 @@ export interface DiagReport {
  * reachable from the working host half, so it is the one surface that can still
  * answer when the UI cannot.
  */
-export async function fetchDiag(): Promise<DiagReport | null> {
+export async function fetchDiag(): Promise<DiagOutcome> {
   try {
     const response = await fetch(api(`${API}/diag`))
-    if (!response.ok) return null
-    return (await response.json()) as DiagReport
-  } catch {
-    return null
+    if (!response.ok) return { kind: 'missing', status: response.status }
+    return { kind: 'ok', report: (await response.json()) as DiagReport }
+  } catch (error) {
+    return { kind: 'error', message: error instanceof Error ? error.message : 'network error' }
   }
 }
 

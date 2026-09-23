@@ -29,6 +29,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { queryParam, readJsonBody, sameOrigin, sendJson } from './http.ts'
 import { RunRegistry, type HostServices } from './runs.ts'
 import { errorMessage } from './prompt.ts'
+import { API_VERSION } from './protocol.ts'
 
 /** The module name the profile patch inserts. */
 export const name = 'dsh-prompt-workbench'
@@ -94,9 +95,13 @@ export function apply(ctx: Context): void {
     handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
   ): (() => void) => webServer.register({ kind, path, handler })
 
-  /** `GET /meta` — the model route in force and the host-side limits. */
+  /**
+   * `GET /meta` — the model route in force, the host-side limits, and this
+   * host half's wire revision. The browser half compares the last one against
+   * its own so a stale host build reports itself instead of looking broken.
+   */
   const meta = route('exact', `${API}/meta`, (_request, response) => {
-    sendJson(response, 200, registry.meta())
+    sendJson(response, 200, { ...registry.meta(), apiVersion: API_VERSION })
   })
 
   /** `POST /start` — begin one rewrite. Body: `{ text, mode, lang }`. */
@@ -182,7 +187,14 @@ export function apply(ctx: Context): void {
     let clientPath: string | null = null
     let clientBundleExists = false
 
-    const clientModules = host.get('clientModules') as ClientModulesLike | undefined
+    // The registry lookup is itself a probe: a throwing context access must
+    // become a reported check, not a 500 that reads as "unreachable".
+    let clientModules: ClientModulesLike | undefined
+    try {
+      clientModules = host.get('clientModules') as ClientModulesLike | undefined
+    } catch (error) {
+      checks.push({ id: 'client-modules', ok: false, detail: `读取 clientModules 失败：${errorMessage(error)}` })
+    }
     if (clientModules === undefined || clientModules === null) {
       checks.push({ id: 'client-modules', ok: false, detail: 'clientModules 服务不可用（该 profile 没有 web 外壳）' })
     } else {
@@ -239,6 +251,7 @@ export function apply(ctx: Context): void {
     sendJson(response, 200, {
       ok: true,
       package: PACKAGE_NAME,
+      apiVersion: API_VERSION,
       node: process.versions.node,
       graphRev,
       moduleIds,
