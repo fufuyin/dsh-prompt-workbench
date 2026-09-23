@@ -1,0 +1,75 @@
+{
+  "name": "dsh-prompt-workbench",
+  "version": "0.1.0",
+  "description": "Prompt rewrite workbench for DeepSeek Harness — four rewrite modes, cancellable streaming output, and a token-level before/after diff. 提示词重写工作台。",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "build": "tsc -p tsconfig.json && npm run build:client",
+    "build:client": "tsdown",
+    "preflight": "node scripts/preflight.mjs",
+    "prepare": "npm run build",
+    "prepack": "npm run build && npm run preflight"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "dsh",
+    "prompt",
+    "prompt-engineering",
+    "prompt-enhancement"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fufuyin/dsh-prompt-workbench.git"
+  },
+  "homepage": "https://github.com/fufuyin/dsh-prompt-workbench",
+  "bugs": {
+    "url": "https://github.com/fufuyin/dsh-prompt-workbench/issues"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^22.10.0",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.1",
+    "react": "^18.3.1",
+    "react-dom": "~18.3.1",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.7.0"
+  }
+}

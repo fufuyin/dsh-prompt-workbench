@@ -1,0 +1,8 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# `name` is the module specifier the Loader resolves from the profile
+# directory, i.e. this package's npm name — it must match `package.json#name`
+# exactly. `id` is the row identity later layers override by.
+- insert:
+    - id: dsh-prompt-workbench
+      name: dsh-prompt-workbench

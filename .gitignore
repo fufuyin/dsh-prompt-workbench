@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts (`lib/`, `client/client.js`) are COMMITTED on purpose.
+# pnpm 10+ blocks dependency build scripts by default, so a git install
+# (`dsh plugin --profile web add github:<owner>/<repo>`) would otherwise land a
+# package with no compiled host half and no browser bundle. Sourcemaps and
+# incremental caches are the only build noise worth ignoring.
+*.tsbuildinfo
+client/*.map
+
+# Local caches and packaging leftovers. Lockfiles ARE committed: installs stay
+# reproducible, and `scripts/preflight.mjs` asserts they resolve only from
+# registry.npmjs.org.
+.npm-cache/
+*.tgz
+
+# Secrets — never commit real credentials. `.env.example` is allowed.
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and scratch output
+*.log
+npm-debug.log*
+coverage/

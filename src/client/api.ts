@@ -1,0 +1,105 @@
+/**
+ * The browser half's carrier: plain `fetch` against the plugin's own routes.
+ *
+ * `api()` resolves every path against `document.baseURI` rather than the site
+ * root, so the plugin keeps working behind a reverse proxy that mounts the
+ * harness under a path prefix. (Root-absolute URLs silently 404 there.)
+ */
+
+/** The plugin's route namespace, matching the host half. */
+const API = '/dsh-prompt-workbench/api'
+
+/** Resolve a route against the document base. */
+export function api(path: string): string {
+  const relative = path.replace(/^\/+/, '')
+  if (typeof document === 'undefined') return `/${relative}`
+  return new URL(relative, document.baseURI).pathname
+}
+
+/** What `/meta` answers. */
+export interface WorkbenchMeta {
+  readonly ok: boolean
+  readonly available: boolean
+  readonly provider: string | null
+  readonly model: string | null
+  readonly maxInputChars: number
+  readonly modes: readonly string[]
+}
+
+/** One poll answer. */
+export interface RunSnapshot {
+  readonly ok: boolean
+  readonly status?: 'running' | 'done' | 'error' | 'stopped'
+  readonly delta?: string
+  readonly cursor?: number
+  readonly reset?: boolean
+  readonly chars?: number
+  readonly elapsedMs?: number
+  readonly error?: string
+  readonly message?: string
+  readonly code?: string
+}
+
+/** A start answer. */
+export interface StartAnswer {
+  readonly ok: boolean
+  readonly taskId?: string
+  readonly provider?: string
+  readonly model?: string
+  readonly message?: string
+  readonly code?: string
+}
+
+/** Read the host's meta payload. Never throws. */
+export async function fetchMeta(): Promise<WorkbenchMeta | null> {
+  try {
+    const response = await fetch(api(`${API}/meta`))
+    if (!response.ok) return null
+    return (await response.json()) as WorkbenchMeta
+  } catch {
+    return null
+  }
+}
+
+/** Begin one rewrite. */
+export async function startRun(body: {
+  readonly text: string
+  readonly mode: string
+  readonly lang: string
+}): Promise<StartAnswer> {
+  try {
+    const response = await fetch(api(`${API}/start`), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const payload = (await response.json()) as StartAnswer
+    return payload
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'network error' }
+  }
+}
+
+/** Read the delta since `cursor`. */
+export async function pollRun(taskId: string, cursor: number): Promise<RunSnapshot> {
+  try {
+    const query = `id=${encodeURIComponent(taskId)}&cursor=${String(cursor)}`
+    const response = await fetch(api(`${API}/poll?${query}`))
+    return (await response.json()) as RunSnapshot
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'network error' }
+  }
+}
+
+/** Abort one live run. */
+export async function cancelRun(taskId: string): Promise<void> {
+  try {
+    await fetch(api(`${API}/cancel`), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: taskId }),
+    })
+  } catch {
+    // Cancellation is best-effort; the run also ends on its own.
+  }
+}
